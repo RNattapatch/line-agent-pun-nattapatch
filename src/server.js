@@ -123,10 +123,16 @@ async function handleEvent(event) {
   /*
    * ใช้ replyMessage ไม่ใช่ pushMessage:
    * reply ภายใน 24 ชม.ไม่กินโควตารายเดือน ส่วน push กิน
+   *
+   * แจ้งแอดมินใน finally — ถ้าตอบลูกค้าไม่สำเร็จ (reply token หมดอายุ / LINE ล่ม)
+   * ยิ่งต้องแจ้ง เพราะลูกค้ากำลังรอโดยไม่มีใครรู้ เดิมโค้ดอยู่หลัง replyMessage
+   * พอ throw ขึ้นมา แอดมินเลยไม่เคยได้รับแจ้งในเคสที่ต้องการมากที่สุด
    */
-  await client.replyMessage({ replyToken: event.replyToken, messages });
-
-  if (escalate) await notifyAdmin(escalate, event);
+  try {
+    await client.replyMessage({ replyToken: event.replyToken, messages });
+  } finally {
+    if (escalate) await notifyAdmin(escalate, event);
+  }
 }
 
 /*
