@@ -12,6 +12,7 @@
 
 import { PRODUCTS, matchProduct } from "./products.js";
 import { getImage, getStaffImage, toPublicUrl } from "./image-cache.js";
+import { needsHuman } from "./brain.js";
 
 /* ข้อความสำรอง — เขียนตามที่ context.md ข้อ 6 กำหนดไว้ทุกตัวอักษร ห้ามแก้ถ้อยคำ */
 export const NO_IMAGE_REPLY = "รุ่นนี้ยังไม่มีรูปในระบบค่ะ เดี๋ยวแจ้งแอดมินส่งรูปให้นะคะ";
@@ -107,7 +108,17 @@ export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
     };
   }
 
-  return { messages: [text("รับทราบค่ะ เดี๋ยวแอดมินมาตอบให้นะคะ")], escalate: "ข้อความที่บอทยังตอบเองไม่ได้" };
+  /*
+   * กฎตายตัวตอบไม่ได้ — ส่งต่อให้สมองร้าน (src/brain.js) ลองตอบก่อน
+   * askBrain เป็นแค่ "ธง" ไม่ใช่การเรียก network จริง เพื่อให้ buildReply ยัง pure
+   * และเทสต์ยังไล่ทุกเส้นทางได้โดยไม่ต้องต่อเน็ต — server.js เป็นคนเรียกจริง
+   * ถ้าสมองตอบไม่ได้ ลูกค้าจะได้ข้อความชุดนี้แทน (เท่ากับพฤติกรรมเดิมเป๊ะ)
+   */
+  return {
+    messages: [text("รับทราบค่ะ เดี๋ยวแอดมินมาตอบให้นะคะ")],
+    escalate: "ข้อความที่บอทยังตอบเองไม่ได้",
+    askBrain: !needsHuman(t),
+  };
 }
 
 /*

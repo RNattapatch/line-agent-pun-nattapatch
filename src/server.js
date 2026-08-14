@@ -10,6 +10,7 @@ import {
 import { loadDotEnv } from "./env.js";
 import { buildReply } from "./reply.js";
 import { IMAGE_DIR, readCache } from "./image-cache.js";
+import { askBrain, loadBrain } from "./brain.js";
 
 loadDotEnv();
 
@@ -48,6 +49,17 @@ const client = new messagingApi.MessagingApiClient({
 const imageCache = readCache();
 const imageCount = Object.keys(imageCache.products ?? {}).length;
 console.log(`🖼  โหลดแคชรูปสินค้า ${imageCount} รายการ`);
+
+/*
+ * สมองร้านใช้ตอบคำถามปลายเปิด ขาดไปไม่ทำให้บอทดับ — แค่กลับไปตอบข้อความสำรอง
+ * แล้วส่งต่อแอดมินเหมือนก่อนมีสมอง จึงเตือนเฉย ๆ ไม่ exit
+ */
+const brainChars = loadBrain().length;
+if (!process.env.OPENROUTER_API_KEY) {
+  console.warn("⚠️  ไม่ได้ตั้ง OPENROUTER_API_KEY — คำถามปลายเปิดจะส่งต่อแอดมินทั้งหมด");
+} else {
+  console.log(`🧠 โหลดสมองร้าน ${brainChars.toLocaleString()} ตัวอักษร`);
+}
 
 const app = express();
 
@@ -90,7 +102,23 @@ async function handleEvent(event) {
    * รูปทั้งหมดถูกสร้างไว้ล่วงหน้าแล้ว (npm run gen:images) ตรงนี้แค่หยิบจากแคช
    * เลยตอบได้ในระดับมิลลิวินาที ทันหน้าต่าง 10 วินาทีของ LINE เสมอ
    */
-  const { messages, escalate } = buildReply(text, { baseUrl: PUBLIC_BASE_URL, cache: imageCache });
+  const reply = buildReply(text, { baseUrl: PUBLIC_BASE_URL, cache: imageCache });
+  let { messages, escalate } = reply;
+
+  /*
+   * กฎตายตัวตอบไม่ได้ → ให้สมองร้านลองตอบ (เรื่องรูปไม่มีทางมาถึงตรงนี้)
+   * ตอบได้ = ลูกค้าได้คำตอบจริง ไม่ต้องรอแอดมิน · ตอบไม่ได้ = ใช้ข้อความสำรองเดิม
+   *
+   * ตรงนี้ทำหลังตอบ 200 ให้ LINE ไปแล้ว จึงไม่ชนหน้าต่าง 10 วินาทีของ webhook
+   * ส่วน reply token มีอายุราว 1 นาที เพียงพอกับเพดาน 12 วินาทีของ askBrain
+   */
+  if (reply.askBrain) {
+    const answer = await askBrain(text);
+    if (answer) {
+      messages = [{ type: "text", text: answer }];
+      escalate = null;
+    }
+  }
 
   /*
    * ใช้ replyMessage ไม่ใช่ pushMessage:
