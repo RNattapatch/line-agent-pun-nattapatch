@@ -41,6 +41,42 @@ npm start
 
 รันเทสต์: `npm test` (ใช้ `node --test` ที่มากับ Node ไม่ต้องลง framework เพิ่ม)
 
+## ที่รันจริงตอนนี้ (production)
+
+บอทตัวนี้รันอยู่บน VPS `srv1840715` แล้ว และ LINE OA ชี้ webhook มาที่ตัวนี้
+
+| | ค่า |
+|---|---|
+| URL | `https://line-bot.srv1840715.hstgr.cloud` |
+| webhook | `POST /webhook` |
+| compose project | `/docker/line-agent` |
+| โค้ด (clone ของ repo นี้) | `/docker/line-agent/app` |
+| container | `line-agent-line-agent-1` (`node:22-alpine`) |
+| auto-update | `/root/line-agent-sync.sh` — cron ทุก 5 นาที |
+| log การ sync | `/var/log/line-agent-sync.log` |
+
+**แก้บอท = push ขึ้น `main`** แล้วรอไม่เกิน 5 นาที cron จะ `git pull` แล้ว restart ให้เอง
+เฉพาะตอนที่ commit เปลี่ยนจริง (ไม่ restart ฟรี ๆ ทุก 5 นาที)
+
+TLS มาจาก traefik + Let's Encrypt อัตโนมัติ · `.env` บน VPS อยู่ที่ `/docker/line-agent/.env`
+(โหมด 600) ใช้ channel เดียวกับที่ Hermes เคยใช้ จึงไม่ต้องออก token ใบใหม่
+
+### ก่อนหน้านี้เคยใช้ Hermes Agent
+
+LINE OA เคยชี้ไปที่ `hermes-bakery.srv1840715.hstgr.cloud/line/webhook` ซึ่งเป็น LLM agent
+ที่อ่านไฟล์สมองร้าน (`context.md` / `products.md` / `promotions.md`) จาก repo นี้
+**ตัวนั้นส่งได้แต่ข้อความ ส่งรูปไม่ได้** — พอสมองร้านสั่งให้ส่งรูปแล้วทำไม่ได้
+โมเดลเลยด้นสดพิมพ์ path ให้ลูกค้าเห็น (`รูปพนักงานอยู่ที่นี่ค่ะ: /images/staff.jpg`)
+
+ตอนนี้ย้ายมาใช้ Worker ตัวนี้แล้ว ซึ่งส่ง message ชนิด `image` ได้ตรง ๆ
+stack ของ Hermes ยังอยู่บน VPS แต่ไม่ได้รับ webhook แล้ว — เก็บไว้เป็นทางถอย
+
+**ถอยกลับไป Hermes** (ถ้าจำเป็น):
+
+```bash
+ssh root@srv1840715.hstgr.cloud 'set -a; . /docker/line-agent/.env; set +a; curl -s -X PUT -H "Authorization: Bearer $CHANNEL_ACCESS_TOKEN" -H "Content-Type: application/json" -d "{\"endpoint\":\"https://hermes-bakery.srv1840715.hstgr.cloud/line/webhook\"}" https://api.line.me/v2/bot/channel/webhook/endpoint'
+```
+
 ## ความปลอดภัยที่ทำไว้แล้ว
 
 - **ตรวจลายเซ็นทุกคำขอ** ด้วย `middleware()` ของ SDK ถ้า header `x-line-signature`
