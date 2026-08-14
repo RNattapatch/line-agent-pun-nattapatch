@@ -89,15 +89,23 @@ app.post("/webhook", middleware({ channelSecret: CHANNEL_SECRET }), async (req, 
       try {
         await handleEvent(event);
       } catch (err) {
-        if (err instanceof HTTPFetchError) {
-          console.error(`LINE API ${err.status}:`, err.body);
-        } else {
-          console.error("จัดการ event ไม่สำเร็จ:", err);
-        }
+        logFailure("จัดการ event ไม่สำเร็จ", err);
       }
     }),
   );
 });
+
+/*
+ * error จาก LINE API มี stack trace กับ header ติดมาเป็นพรืด อ่านแล้วหาสาระไม่เจอ
+ * ตัวที่บอกเหตุจริงคือ status กับ body เท่านั้น — ที่เหลือเก็บไว้เฉพาะ error ที่ไม่รู้จัก
+ */
+function logFailure(label, err) {
+  if (err instanceof HTTPFetchError) {
+    console.error(`LINE API ${err.status}:`, err.body);
+  } else {
+    console.error(`${label}:`, err);
+  }
+}
 
 /*
  * ลูกค้าพิมพ์ทีละบับเบิลสั้น ๆ ต่อกัน ถ้าตอบทันทีที่บับเบิลแรกจะตอบผิดบริบท
@@ -156,6 +164,9 @@ async function handleBatch({ texts, replyToken, event, reason }) {
    */
   try {
     await client.replyMessage({ replyToken, messages });
+  } catch (err) {
+    // ดักตรงนี้เอง ไม่ปล่อยขึ้นไปให้ inbox — จะได้ log แบบสั้นเหมือนทางอื่น
+    logFailure("ตอบลูกค้าไม่สำเร็จ", err);
   } finally {
     if (escalate) await notifyAdmin(escalate, event);
   }
