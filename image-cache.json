@@ -1,0 +1,37 @@
+{
+  "products": {
+    "shio-pan": {
+      "name": "ขนมปังชิโอะปัง",
+      "path": "/images/shio-pan.jpg",
+      "bytes": 652800,
+      "model": "google/nano-banana",
+      "taskId": "70f72c86b942e8657527f62d4700bee4",
+      "generatedAt": "2026-08-14T06:16:15.422Z"
+    },
+    "box-set-1": {
+      "name": "Box Set 1",
+      "path": "/images/box-set-1.jpg",
+      "bytes": 631746,
+      "model": "google/nano-banana",
+      "taskId": "ae14a8f0f05f44c631484f6eb88deb10",
+      "generatedAt": "2026-08-14T06:20:13.784Z"
+    },
+    "brownie-piece": {
+      "name": "บราวนี่ (ชิ้น)",
+      "path": "/images/brownie-piece.jpg",
+      "bytes": 543532,
+      "model": "google/nano-banana",
+      "taskId": "540da42d58ace0037eb9a02c45751a78",
+      "generatedAt": "2026-08-14T06:17:55.326Z"
+    },
+    "brownie-box": {
+      "name": "บราวนี่ (กล่อง 6 ชิ้น)",
+      "path": "/images/brownie-box.jpg",
+      "bytes": 853112,
+      "model": "google/nano-banana",
+      "taskId": "e00ec4b6c95aa715cd1c990c4f0b2e7d",
+      "generatedAt": "2026-08-14T06:26:11.445Z"
+    }
+  },
+  "updatedAt": "2026-08-14T06:30:00.579Z"
+}
