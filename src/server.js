@@ -11,6 +11,7 @@ import { loadDotEnv } from "./env.js";
 import { buildReply } from "./reply.js";
 import { IMAGE_DIR, readCache } from "./image-cache.js";
 import { askBrain, loadBrain } from "./brain.js";
+import { DEFAULT_DELAY_MS, combine, createInbox } from "./inbox.js";
 
 loadDotEnv();
 
@@ -21,6 +22,9 @@ const {
   ADMIN_USER_ID,
   PORT = 3000,
 } = process.env;
+
+/* เวลาที่รอให้ลูกค้าพิมพ์จบก่อนตอบ — ปรับได้ทาง .env โดยไม่ต้องแก้โค้ด */
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS) || DEFAULT_DELAY_MS;
 
 if (!CHANNEL_ACCESS_TOKEN || !CHANNEL_SECRET) {
   console.error("ขาด CHANNEL_ACCESS_TOKEN หรือ CHANNEL_SECRET — คัดลอก .env.example เป็น .env ก่อน");
@@ -61,6 +65,8 @@ if (!process.env.OPENROUTER_API_KEY) {
   console.log(`🧠 โหลดสมองร้าน ${brainChars.toLocaleString()} ตัวอักษร`);
 }
 
+console.log(`⏳ รอลูกค้าพิมพ์จบ ${(REPLY_DELAY_MS / 1000).toFixed(0)} วินาที ก่อนตอบ`);
+
 const app = express();
 
 // เสิร์ฟรูปสินค้าให้ LINE มาโหลด — เป็นไฟล์นิ่ง ไม่มีข้อมูลลูกค้า
@@ -93,10 +99,29 @@ app.post("/webhook", middleware({ channelSecret: CHANNEL_SECRET }), async (req, 
   );
 });
 
+/*
+ * ลูกค้าพิมพ์ทีละบับเบิลสั้น ๆ ต่อกัน ถ้าตอบทันทีที่บับเบิลแรกจะตอบผิดบริบท
+ * จึงพักไว้ให้ลูกค้าพิมพ์จบก่อน แล้วรวมทั้งชุดค่อยตอบครั้งเดียว (ดู src/inbox.js)
+ */
+const inbox = createInbox({ delayMs: REPLY_DELAY_MS, onFlush: handleBatch });
+
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
 
-  const text = event.message.text.trim();
+  // กลุ่ม/ห้องใช้ id ของกลุ่ม ไม่งั้นข้อความจากคนละคนในกลุ่มเดียวกันจะแยกชุดกันจนตอบมั่ว
+  const chatId = event.source?.groupId ?? event.source?.roomId ?? event.source?.userId;
+  if (!chatId) return;
+
+  inbox.add(chatId, { text: event.message.text.trim(), replyToken: event.replyToken, event });
+}
+
+async function handleBatch({ texts, replyToken, event, reason }) {
+  const text = combine(texts);
+  if (!text) return;
+
+  if (texts.length > 1) {
+    console.log(`💬 รวม ${texts.length} บับเบิลเป็นข้อความเดียว (${reason})`);
+  }
 
   /*
    * รูปทั้งหมดถูกสร้างไว้ล่วงหน้าแล้ว (npm run gen:images) ตรงนี้แค่หยิบจากแคช
@@ -110,7 +135,8 @@ async function handleEvent(event) {
    * ตอบได้ = ลูกค้าได้คำตอบจริง ไม่ต้องรอแอดมิน · ตอบไม่ได้ = ใช้ข้อความสำรองเดิม
    *
    * ตรงนี้ทำหลังตอบ 200 ให้ LINE ไปแล้ว จึงไม่ชนหน้าต่าง 10 วินาทีของ webhook
-   * ส่วน reply token มีอายุราว 1 นาที เพียงพอกับเพดาน 12 วินาทีของ askBrain
+   * ส่วน reply token ที่ใช้เป็นของบับเบิลล่าสุด อายุจึงเหลือเกือบเต็ม (~1 นาที)
+   * พอสำหรับเวลาพัก 7 วิ บวกเพดาน 12 วิของ askBrain
    */
   if (reply.askBrain) {
     const answer = await askBrain(text);
@@ -129,7 +155,7 @@ async function handleEvent(event) {
    * พอ throw ขึ้นมา แอดมินเลยไม่เคยได้รับแจ้งในเคสที่ต้องการมากที่สุด
    */
   try {
-    await client.replyMessage({ replyToken: event.replyToken, messages });
+    await client.replyMessage({ replyToken, messages });
   } finally {
     if (escalate) await notifyAdmin(escalate, event);
   }
@@ -173,4 +199,22 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ error: "internal error" });
 });
 
-app.listen(PORT, () => console.log(`Worker ทำงานที่ port ${PORT} — webhook: POST /webhook`));
+const server = app.listen(PORT, () =>
+  console.log(`Worker ทำงานที่ port ${PORT} — webhook: POST /webhook`),
+);
+
+/*
+ * ตอนรีสตาร์ต (deploy ใหม่) จะมีลูกค้าที่ข้อความยังพักอยู่ในคิว
+ * ถ้าดับเลยลูกค้ากลุ่มนั้นจะไม่ได้รับคำตอบและไม่มีใครรู้ — ตอบให้จบก่อนค่อยดับ
+ */
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, async () => {
+    console.log(`ได้รับ ${signal} — ตอบข้อความที่ค้างอยู่ ${inbox.size} ชุดก่อนปิด`);
+    server.close();
+    try {
+      await inbox.flushAll();
+    } finally {
+      process.exit(0);
+    }
+  });
+}
