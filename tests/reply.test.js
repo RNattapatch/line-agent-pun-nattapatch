@@ -18,6 +18,7 @@ const fullCache = {
   products: Object.fromEntries(
     PRODUCTS.map((p) => [p.slug, { name: p.name, path: `/images/${p.slug}.jpg` }]),
   ),
+  staff: { name: "พนักงานประจำร้าน (น้องแมว 2 ตัว)", path: "/images/staff.jpg" },
 };
 
 /* แคชว่าง = ยังไม่เคยรัน gen:images หรือ kie.ai ล่มตอน gen */
@@ -102,6 +103,27 @@ test("ขอดูรูปแบบไม่ระบุสินค้า → 
   for (const p of PRODUCTS) assert.match(reply, new RegExp(p.name.replace(/[()]/g, "\\$&")));
 });
 
+test("ขอดูรูปพนักงาน → ส่งรูปน้องแมวประจำร้าน ไม่ต้องรบกวนแอดมิน", () => {
+  for (const text of ["ขอดูรูปพนักงานหน่อยค่ะ", "มีรูปพนักงานไหมคะ", "ขอดูพนักงานประจำร้านหน่อย", "staff หน้าตายังไง"]) {
+    const r = say(text);
+
+    const image = r.messages.find((m) => m.type === "image");
+    assert.ok(image, `"${text}" ควรได้รูปพนักงาน`);
+    assert.equal(image.originalContentUrl, `${BASE}/images/staff.jpg`);
+    assert.equal(image.previewImageUrl, `${BASE}/images/staff.jpg`);
+    assert.match(texts(r).join(" "), /พนักงาน/);
+    assert.equal(r.escalate, null, "มีรูปพนักงานในระบบแล้ว ไม่ต้องส่งต่อแอดมิน");
+  }
+});
+
+test("ขอดูรูปพนักงานแต่รูปไม่อยู่ในแคช → ตอบสุภาพ + ส่งต่อแอดมิน ไม่มีศัพท์เทคนิค", () => {
+  const r = say("ขอดูรูปพนักงานหน่อยค่ะ", emptyCache);
+
+  assert.ok(!r.messages.some((m) => m.type === "image"), "ไม่มีรูปก็ต้องไม่ส่ง URL ที่โหลดไม่ขึ้น");
+  assert.match(texts(r).join(" "), /แอดมิน/);
+  assert.ok(r.escalate, "ต้องส่งต่อแอดมินให้ส่งรูปแทน");
+});
+
 test('ถามว่า "ของจริงหน้าตาแบบนี้ไหม" → ไม่ยืนยัน ส่งต่อแอดมินขอรูปจริง', () => {
   for (const text of ["ของจริงหน้าตาแบบนี้ไหมคะ", "รูปนี้ตรงปกไหม", "ของจริงเหมือนรูปหรือเปล่า"]) {
     const r = say(text);
@@ -126,6 +148,7 @@ const ALL_INPUTS = [
   "ขอดูรูปบราวนี่",
   "ขอรูปบราวนี่กล่อง",
   "ขอดูรูปหน่อย",
+  "ขอดูรูปพนักงานหน่อย",
   "ขอรูปครัวซองต์",
   "ของจริงหน้าตาแบบนี้ไหม",
   "ราคาเท่าไหร่",

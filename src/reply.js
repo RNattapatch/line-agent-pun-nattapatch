@@ -11,7 +11,7 @@
  */
 
 import { PRODUCTS, matchProduct } from "./products.js";
-import { getImage, toPublicUrl } from "./image-cache.js";
+import { getImage, getStaffImage, toPublicUrl } from "./image-cache.js";
 
 /* ข้อความสำรอง — เขียนตามที่ context.md ข้อ 6 กำหนดไว้ทุกตัวอักษร ห้ามแก้ถ้อยคำ */
 export const NO_IMAGE_REPLY = "รุ่นนี้ยังไม่มีรูปในระบบค่ะ เดี๋ยวแจ้งแอดมินส่งรูปให้นะคะ";
@@ -31,6 +31,13 @@ const image = (url) => ({
 const asksForImage = (t) => /(รูป|ภาพ|photo|pic|image)/i.test(t);
 
 /*
+ * ลูกค้าอยากเห็นพนักงานประจำร้านหรือเปล่า
+ * รับทั้ง "ขอดูรูปพนักงาน" และ "ขอดูพนักงานหน่อย" (ไม่มีคำว่ารูปก็เจตนาเดียวกัน)
+ */
+const asksForStaff = (t) =>
+  /(พนักงาน|สตาฟ|สต๊าฟ|staff)/i.test(t) && /(รูป|ภาพ|ดู|เห็น|หน้าตา|photo|pic)/i.test(t);
+
+/*
  * ลูกค้ากำลังถามว่า "ของจริงเหมือนรูปไหม" หรือเปล่า
  * ต้องเช็คก่อน asksForImage เพราะประโยคพวกนี้มีคำว่า "รูป" อยู่ด้วย
  */
@@ -48,6 +55,12 @@ const menuLine = (p) => `• ${p.name} ${p.price}`;
  */
 export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
   const t = String(input ?? "").trim();
+
+  /*
+   * เช็คก่อน doubtsRealPhoto — รูปพนักงานเป็นรูปถ่ายจริง ไม่ใช่รูป gen
+   * ประโยคอย่าง "พนักงานหน้าตาแบบนี้เหรอ" เลยไม่ต้องส่งต่อแอดมินขอรูปจริง
+   */
+  if (asksForStaff(t)) return staffReply({ baseUrl, cache, imageDir });
 
   if (asksForImage(t) && doubtsRealPhoto(t)) {
     return { messages: [text(REAL_PHOTO_REPLY)], escalate: "ลูกค้าขอรูปถ่ายสินค้าจริง" };
@@ -70,6 +83,27 @@ export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
   }
 
   return { messages: [text("รับทราบค่ะ เดี๋ยวแอดมินมาตอบให้นะคะ")], escalate: "ข้อความที่บอทยังตอบเองไม่ได้" };
+}
+
+/*
+ * รูปพนักงานประจำร้าน — น้องแมว 2 ตัวของร้าน เป็นรูปถ่ายจริง
+ * ถ้ารูปหาย/แคชพัง ให้ตอบสั้น ๆ แล้วส่งต่อแอดมิน เหมือนกรณีรูปสินค้า (ห้ามหลุดศัพท์เทคนิค)
+ */
+function staffReply({ baseUrl, cache, imageDir }) {
+  const entry = getStaffImage(dropUndefined({ cache, imageDir }));
+  const url = entry ? toPublicUrl(baseUrl, entry.path) : null;
+
+  if (!url) {
+    return {
+      messages: [text("เดี๋ยวแจ้งแอดมินส่งรูปพนักงานให้นะคะ รอสักครู่ค่ะ")],
+      escalate: "ยังไม่มีรูปพนักงานในระบบ",
+    };
+  }
+
+  return {
+    messages: [image(url), text("นี่คือพนักงานประจำร้านของเราค่ะ ดูแลหน้าร้านทุกวันเลยค่ะ")],
+    escalate: null,
+  };
 }
 
 function imageReply(t, { baseUrl, cache, imageDir }) {

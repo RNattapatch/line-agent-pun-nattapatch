@@ -48,7 +48,19 @@ export function writeCache(cache, file = CACHE_FILE) {
  * ถ้าขาดข้อใดข้อหนึ่งให้คืน null แล้วผู้เรียกไปใช้ข้อความสำรอง — ห้ามส่ง URL ที่รูปพังไปหาลูกค้า
  */
 export function getImage(slug, { cache = readCache(), imageDir = IMAGE_DIR } = {}) {
-  const entry = cache.products?.[slug];
+  return validEntry(cache.products?.[slug], imageDir);
+}
+
+/*
+ * รูปพนักงานประจำร้าน (น้องแมว 2 ตัว) — เป็นรูปถ่ายจริงที่เจ้าของร้านอัปโหลดเอง
+ * ไม่ได้ gen จาก kie.ai เลยอยู่คนละ key กับ products ใน image-cache.json
+ * (แยกไว้ด้วยเพื่อไม่ให้ gen:images -- --force ไปยุ่งกับรูปนี้)
+ */
+export function getStaffImage({ cache = readCache(), imageDir = IMAGE_DIR } = {}) {
+  return validEntry(cache.staff, imageDir);
+}
+
+function validEntry(entry, imageDir) {
   if (!entry?.path) return null;
 
   const file = path.join(imageDir, path.basename(entry.path));
