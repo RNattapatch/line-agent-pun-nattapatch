@@ -1,0 +1,32 @@
+# ---------------------------------------------------------
+#  กันความลับหลุดขึ้น GitHub (repo นี้เป็น public)
+# ---------------------------------------------------------
+# ทุกไฟล์ env
+.env
+.env.*
+!.env.example
+
+# เผื่อมีคนก๊อป Builder credentials เข้ามาในโปรเจกต์
+.line-builder/
+*channel*token*
+*access*token*
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+
+# MCP config ระดับโปรเจกต์ — Builder tools ต้องไม่ถูก commit
+.mcp.json
+
+# Claude Code local state
+.claude/settings.local.json
+
+# Node
+node_modules/
+npm-debug.log*
+dist/
+build/
+
+# macOS
+.DS_Store
