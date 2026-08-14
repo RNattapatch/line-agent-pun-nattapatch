@@ -175,6 +175,13 @@ test("ไม่มีคำต้องห้ามหลุดไปหาล�
     /โมเดล/,
     /สร้างรูป(ภาพ)?ไม่ได้/,
     /generate|kie\.ai|api|error|cache|แคช|url|http/i,
+    /*
+     * เคยหลุดจริงมาแล้ว: บอทตอบว่า "รูปพนักงานอยู่ที่นี่ค่ะ: /images/staff.jpg"
+     * ลูกค้าขอดูรูป ต้องได้เห็นรูป ไม่ใช่ได้ path ที่กดไม่ได้ — path ต้องอยู่ในช่อง
+     * originalContentUrl ของ message ชนิด image เท่านั้น ห้ามโผล่ในเนื้อข้อความ
+     */
+    /\/images\//,
+    /\.(jpe?g|png)\b/i,
   ];
 
   for (const input of ALL_INPUTS) {

@@ -116,6 +116,32 @@ npm run gen:images -- --force               # สร้างใหม่ทั�
 อยากเปลี่ยนรูปพนักงาน: วางไฟล์ใหม่ทับ `public/images/staff.jpg` (JPEG, ไม่เกิน 1 MB)
 แล้วรีสตาร์ตเซิร์ฟเวอร์
 
+### 🚫 บั๊กที่เคยเกิด: บอทส่ง path มาแทนรูป
+
+ลูกค้าถาม *"ขอดูรูปพนักงาน"* แล้วได้ข้อความว่า `รูปพนักงานอยู่ที่นี่ค่ะ: /images/staff.jpg`
+ลูกค้ากดไม่ได้ เปิดไม่ได้ ไม่เห็นรูป
+
+**สาเหตุ:** รูปยังไม่มีที่อยู่บนอินเทอร์เน็ต — `PUBLIC_BASE_URL` ไม่ได้ตั้งไว้
+`/images/staff.jpg` เป็น path บนดิสก์ของเครื่องเรา ไม่ใช่ URL ที่ LINE ไปโหลดได้
+
+**ที่แก้ไปแล้ว:**
+
+1. ตั้ง `PUBLIC_BASE_URL` ชี้ไปที่ GitHub raw ของ repo นี้ (repo เป็น public อยู่แล้ว)
+   → ได้ HTTPS ฟรี ไม่ต้องเปิด ngrok ค้างไว้ ไม่ต้องเช่า host
+   ```
+   PUBLIC_BASE_URL=https://raw.githubusercontent.com/RNattapatch/line-agent-pun-nattapatch/main/public
+   ```
+   ⚠️ ใช้ได้เพราะรูปเป็นไฟล์สาธารณะล้วน ๆ — ห้ามเอาวิธีนี้ไปใช้กับอะไรที่เป็นความลับ
+2. เพิ่มกติกา **"ห้ามส่ง path หรือ URL เป็นข้อความ"** ลง [`context.md`](context.md) ข้อ 6
+3. เพิ่มเทสต์กวาด `/images/` กับ `.jpg` ในเนื้อข้อความ — path ต้องอยู่ในช่อง
+   `originalContentUrl` ของ message ชนิด `image` เท่านั้น ถ้าหลุดมาเป็นตัวหนังสือเทสต์จะแดง
+
+**ตรวจว่ารูปโหลดได้จริงไหม** (ต้องได้ `200` กับ `content-type: image/jpeg`):
+
+```bash
+curl -sSI "$(grep PUBLIC_BASE_URL .env | cut -d= -f2-)/images/staff.jpg" | head -3
+```
+
 ### ถ้ารูปไม่มี / kie.ai ล่ม
 
 ลูกค้าจะได้ข้อความเดียวเสมอ ตามที่ [`context.md`](context.md) ข้อ 6 กำหนด:
