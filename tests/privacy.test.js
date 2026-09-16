@@ -176,3 +176,14 @@ test("ไม่มีรูปที่ลูกค้าส่งมาหล�
     assert.equal(fs.existsSync(path.join(ROOT, d)), false, `ห้ามมีโฟลเดอร์ ${d} ใน repo`);
   }
 });
+
+test("ผลวิเคราะห์ของ Build Lab ไม่หลุดเข้า repo", async () => {
+  const { labDir } = await import("../src/lab/guard.js");
+  assert.ok(!path.resolve(labDir()).startsWith(ROOT + path.sep), `staging output ต้องอยู่นอก repo: ${labDir()}`);
+
+  const offenders = trackedFiles().filter((f) => /^(shop-lab|lab-out)\//.test(f));
+  assert.deepEqual(offenders, [], `ผล Lab ต้องไม่ถูก track: ${offenders.join(", ")}`);
+
+  const ignore = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
+  assert.match(ignore, /shop-lab/, ".gitignore ต้องกันไว้เผื่อมีคนตั้ง LAB_OUT_DIR ชี้มาที่ repo");
+});

@@ -14,7 +14,8 @@
     "test": "node --test \"tests/*.test.js\"",
     "check:cards": "node scripts/check-card-images.mjs",
     "check:qr": "node scripts/check-qr.mjs",
-    "admin": "node scripts/admin-tool.mjs"
+    "admin": "node scripts/admin-tool.mjs",
+    "lab": "node scripts/lab.mjs"
   },
   "dependencies": {
     "@line/bot-sdk": "^11.2.0",

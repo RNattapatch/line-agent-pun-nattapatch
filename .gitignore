@@ -33,3 +33,7 @@ build/
 
 # ธุรกรรมจริง — อยู่บน VPS ที่ ~/shop-data เท่านั้น ห้ามขึ้น repo เด็ดขาด
 shop-data/
+
+# ผลวิเคราะห์ของ Build Lab — staging output ห้ามปนกับ repo production
+shop-lab/
+lab-out/
