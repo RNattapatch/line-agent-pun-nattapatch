@@ -61,6 +61,14 @@ export function handleQuoteRequest(parsed, { store, chatId, lineUserId } = {}) {
      * ลูกค้าได้ยินแค่ว่ากำลังให้เจ้าของร้านดูให้ (context.md ข้อ 5) ไม่ได้ยินตัวเลขเพดาน
      * เพราะบอกไปเท่ากับสอนให้ต่อรองมาที่ขอบพอดีทุกครั้ง
      */
+    /*
+     * แปลงเหตุผลที่ตรวจไม่ผ่าน เป็นรหัส trigger ให้ยามแจ้งด่วนใช้
+     * ยามอ่านรหัส ไม่ได้อ่านข้อความไทย — ข้อความแก้คำเมื่อไหร่ยามยังทำงานเหมือนเดิม
+     */
+    const triggers = [];
+    if (reasons.some((r) => r.includes("เกินเพดาน"))) triggers.push("over_discount");
+    if (reasons.some((r) => r.includes("เกินเกณฑ์"))) triggers.push("high_value");
+
     return {
       messages: [text("ขอส่งให้เจ้าของร้านดูให้นะคะ รอสักครู่ค่ะ")],
       escalate: [
@@ -71,6 +79,8 @@ export function handleQuoteRequest(parsed, { store, chatId, lineUserId } = {}) {
         `ปฏิเสธ: ปฏิเสธใบเสนอ ${quote.quote_id}`,
       ].join("\n"),
       quote,
+      triggers,
+      nextStep: `อนุมัติใบเสนอ ${quote.quote_id} หรือ ปฏิเสธใบเสนอ ${quote.quote_id}`,
     };
   }
 

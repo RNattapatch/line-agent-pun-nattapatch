@@ -154,3 +154,25 @@ test("สถานะสิทธิ์ผู้ดูแลเก็บนอ�
   const { adminDir } = await import("../src/admin-claim.js");
   assert.ok(!adminDir().startsWith(ROOT + path.sep), `ต้องไม่อยู่ใน repo: ${adminDir()}`);
 });
+
+test("ทุกที่เก็บข้อมูลลูกค้าอยู่นอก repo (PDPA)", async () => {
+  const { eventsDir } = await import("../src/customer-events.js");
+  const { slipsDir } = await import("../src/media.js");
+  const { incidentsDir } = await import("../src/incidents.js");
+
+  for (const [name, dir] of [
+    ["เหตุการณ์ลูกค้า", eventsDir()],
+    ["รูปที่ลูกค้าส่งมา", slipsDir()],
+    ["บันทึกเหตุขัดข้อง", path.resolve(incidentsDir())],
+  ]) {
+    assert.ok(!path.resolve(dir).startsWith(ROOT + path.sep), `${name} ต้องไม่อยู่ใน repo: ${dir}`);
+  }
+});
+
+test("ไม่มีรูปที่ลูกค้าส่งมาหลุดเข้า repo", () => {
+  const offenders = trackedFiles().filter((f) => /^(slips|customer-events|incidents)\//.test(f));
+  assert.deepEqual(offenders, [], `ข้อมูลลูกค้าต้องอยู่บน VPS เท่านั้น: ${offenders.join(", ")}`);
+  for (const d of ["slips", "customer-events", "incidents"]) {
+    assert.equal(fs.existsSync(path.join(ROOT, d)), false, `ห้ามมีโฟลเดอร์ ${d} ใน repo`);
+  }
+});

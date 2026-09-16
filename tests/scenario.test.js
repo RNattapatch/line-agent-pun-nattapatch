@@ -19,6 +19,15 @@ import { createInbox } from "../src/inbox.js";
 import { createPipeline } from "../src/pipeline.js";
 import { PRODUCTS } from "../src/products.js";
 import { createReports } from "../src/reports.js";
+import { createEventLog } from "../src/customer-events.js";
+import { createUrgentGuard } from "../src/urgent-guard.js";
+import { runEveningReport } from "../src/evening-report.js";
+import { createIncidentLog } from "../src/incidents.js";
+import { createFaultBox } from "../src/faults.js";
+import { createMediaStore } from "../src/media.js";
+import { CONFIRM_TTL_MS, MONEY_WORDS, createSlipWaiters } from "../src/slip-flow.js";
+import { hasSystemTerms } from "../src/safe-reply.js";
+import { formatBaht } from "../src/price-source.js";
 import { STATUS, createQuoteStore } from "../src/quotes.js";
 
 const BASE = "https://raw.githubusercontent.com/example/repo/main/public";
@@ -51,6 +60,8 @@ function shop({
   verifyImageUrl = async () => true,
   replyFails = () => false,
   withAdmin = true,
+  allowFaults = false,
+  slipClock = null,
 } = {}) {
   const outbox = []; // ทุกข้อความที่ถูกส่งออกไป ไม่ว่าจะ reply หรือ push
 
@@ -91,6 +102,22 @@ function shop({
   /* claim ด้วยรหัสที่ออกตอนรัน — ไม่มีรหัสตายตัวเขียนไว้ในไฟล์เทสต์ */
   if (withAdmin) claims.claim(claims.issue().code, ADMIN);
 
+  const quiet = { log() {}, warn() {}, error() {} };
+  const events = createEventLog({ dir: path.join(root, "customer-events") });
+  const urgent = createUrgentGuard({ events, reports, dir: path.join(root, "customer-events"), log: quiet });
+  const incidents = createIncidentLog({ dir: path.join(root, "incidents"), log: quiet });
+  const faults = createFaultBox({ claims, env: { ALLOW_FAULT_INJECTION: allowFaults ? "1" : "" } });
+  const media = createMediaStore({ dir: path.join(root, "slips") });
+  const slipWaiters = createSlipWaiters(slipClock ? { now: slipClock } : {});
+
+  /* JPEG ปลอมที่ sniff() ยอมรับ — เทสต์ไม่ต้องยิงเน็ตไปเอารูปจริง */
+  const fakeJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 7)]);
+  let imageFetchFails = false;
+  const fetchImage = async () => {
+    if (imageFetchFails) throw new Error("จำลอง: ดึงรูปจาก LINE ไม่ได้");
+    return fakeJpeg;
+  };
+
   let pipeline;
   const inbox = createInbox({ delayMs: 0, onFlush: (b) => pipeline.handleBatch(b) });
   const dispatcher = createCardDispatcher({
@@ -109,6 +136,14 @@ function shop({
     baseUrl: BASE,
     claims,
     reports,
+    events,
+    urgent,
+    incidents,
+    faults,
+    media,
+    slipWaiters,
+    fetchImage,
+    runEvening: ({ date, testRun } = {}) => runEveningReport({ events, reports, date, testRun }),
     askBrain,
     verifyImageUrl,
     logFailure: () => {},
@@ -124,6 +159,15 @@ function shop({
     replyTo.set(replyToken, source.groupId ?? source.roomId ?? source.userId);
     await pipeline.handleEvent({ type: "message", message: { type: "text", text }, replyToken, source });
     await inbox.flushAll();
+  };
+
+  const sendImageFrom = async (userId) => {
+    await pipeline.handleEvent({
+      type: "message",
+      message: { type: "image", id: `m${outbox.length}` },
+      replyToken: `ti${outbox.length}`,
+      source: { type: "user", userId },
+    });
   };
 
   const sendImage = async () => {
@@ -161,7 +205,9 @@ function shop({
   const reportsTo = (id) =>
     outbox.filter((o) => o.via === "push" && o.to === id).flatMap((o) => o.messages).map((m) => m.text ?? "");
 
-  return { store, claims, reports, dispatcher, conversations, inbox, outbox, say, sendImage, press, buttons, toCustomer, cards, said, toAdmin, reportsTo, pipeline };
+  return { store, claims, reports, events, urgent, incidents, faults, media, slipWaiters,
+    setImageFetchFails: (v) => { imageFetchFails = v; },
+    dispatcher, conversations, inbox, outbox, say, sendImage, press, buttons, toCustomer, cards, said, toAdmin, reportsTo, sendImageFrom, pipeline };
 }
 
 const heroOf = (card) => card.contents?.hero?.url ?? null;
@@ -319,7 +365,7 @@ test("5) ส่งรูป + พิมพ์ 'โอนแล้ว' → ตั
   assert.deepEqual(productCards, [], "หลังสลิปแล้วห้ามมีการ์ดสินค้าตามมาเลย");
 
   /* และสลิปต้องเลื่อนสถานะใบเสนอราคาให้คนไปตรวจยอดต่อ */
-  assert.equal(s.store.list()[0].status, STATUS.SLIP);
+  assert.equal(s.store.list()[0].status, STATUS.SENT, "รูปเพียงลำพังห้ามเปลี่ยนสถานะการเงิน");
 });
 
 test("5b) ลูกค้าส่งรูปโดยไม่มีใบค้าง → ไม่พัง และยังไม่ส่งการ์ด", async () => {
@@ -389,7 +435,10 @@ test("กดขอ QR → ได้ภาพ QR ยอดจาก record แล
   assert.ok(!JSON.stringify(trail).includes("099-999-9999"), "audit ห้ามเก็บเลขบัญชี");
 
   await s.sendImage();
-  assert.equal(s.store.get(id).status, STATUS.SLIP);
+  assert.equal(s.store.get(id).status, STATUS.SENT, "ยังไม่ยืนยัน สถานะห้ามขยับ");
+
+  await s.say("ใช่ค่ะ");
+  assert.equal(s.store.get(id).status, STATUS.SLIP, "ยืนยันแล้วจึงเป็น รับสลิปแล้ว");
 });
 
 test("ลูกค้าส่งสลิป → แอดมินยืนยันยอดจากมือถือ → ยืนยันชำระแล้ว + ลูกค้าได้ข้อความยืนยัน", async () => {
@@ -400,8 +449,12 @@ test("ลูกค้าส่งสลิป → แอดมินยืนย
   await s.say(`ยืนยันสั่งซื้อ ${id}`);
   await s.press(s.buttons().find((d) => d.includes("kind=deposit")));
 
-  /* ลูกค้าโอนแล้วส่งสลิปเข้ามา */
+  /* ลูกค้าโอนแล้วส่งสลิปเข้ามา — ต้องถูกถามยืนยันก่อน */
   await s.sendImage();
+  assert.equal(s.store.get(id).status, STATUS.SENT, "รูปเพียงลำพังห้ามเปลี่ยนสถานะ");
+  assert.match(s.said(), new RegExp(`${id}[^\\n]*ใช่ไหมคะ`), "ต้องถามยืนยันโดยระบุเลขใบ");
+
+  await s.say("ใช่ค่ะ");
   assert.equal(s.store.get(id).status, STATUS.SLIP);
 
   /* ก่อนยืนยัน ลูกค้าต้องได้ยินแค่ "รับสลิปแล้ว รอตรวจ" */
@@ -450,6 +503,7 @@ test("คำสั่งยืนยันยอดที่พิมพ์จ�
   const id = s.store.list()[0].quote_id;
   await s.say(`ยืนยันสั่งซื้อ ${id}`);
   await s.sendImage();
+  await s.say("ใช่ค่ะ");
   assert.equal(s.store.get(id).status, STATUS.SLIP);
 
   await s.say(`ยืนยันยอด ${id}`); // ลูกค้าพิมพ์เอง
@@ -478,11 +532,11 @@ test("ลูกค้ายิง postback ขอ QR ของใบคนอื
   assert.match(toAdmin, /ไม่ใช่ของห้องตัวเอง/);
 });
 
-test("LINE ไม่รับการ์ดช่องทางชำระเงิน → ลูกค้าไม่ได้อะไร แต่แอดมินต้องรู้ทันที", async () => {
+test("LINE ไม่รับ reply การ์ดชำระเงิน → กู้ด้วย push ลูกค้ายังได้การ์ด และมี incident", async () => {
   /*
-   * เคสนี้คือเคสที่พังเงียบได้ง่ายที่สุดทั้งระบบ: โค้ดเราไม่ผิดเลย แต่ LINE ปฏิเสธการ์ด
-   * (เช่นปุ่มคัดลอกใช้ action ชนิดที่เครื่องปลายทางรุ่นเก่าไม่รู้จัก)
-   * ลูกค้ากดยืนยันสั่งซื้อแล้วจอเงียบ ถ้าไม่มีใครรู้ ออเดอร์นั้นหายไปเฉย ๆ
+   * เคสที่พังเงียบได้ง่ายที่สุด: โค้ดเราไม่ผิดเลย แต่ LINE ปฏิเสธ reply
+   * (token หมดอายุ / การ์ดมี action ที่เครื่องปลายทางไม่รู้จัก)
+   * ลูกค้ากดยืนยันสั่งซื้อแล้วจอเงียบ ถ้าไม่มีทางกู้ ออเดอร์นั้นหายไปเฉย ๆ
    */
   const s = shop({ replyFails: (messages) => messages.some((m) => m.type === "flex" && /ชำระเงิน/.test(m.altText)) });
 
@@ -490,9 +544,16 @@ test("LINE ไม่รับการ์ดช่องทางชำระเ
   const id = s.store.list()[0].quote_id;
   await s.say(`ยืนยันสั่งซื้อ ${id}`);
 
-  const toAdmin = s.toAdmin();
-  assert.match(toAdmin, /ส่งการ์ดช่องทางชำระเงินไม่สำเร็จ/);
-  assert.match(toAdmin, new RegExp(id), "ต้องบอกด้วยว่าใบไหน");
+  /* ลูกค้าต้องได้การ์ดอยู่ดี — ผ่านทาง push แทน */
+  const pushed = s.outbox.filter((o) => o.via === "push" && o.to === CUSTOMER).flatMap((o) => o.messages);
+  assert.ok(pushed.some((m) => m.type === "flex"), "ต้องกู้ด้วย push จนลูกค้าได้การ์ดจริง");
+  assert.ok(pushed.some((m) => /ส่งไม่ออก/.test(m.text ?? "")), "และบอกลูกค้าว่าเมื่อครู่ส่งไม่ออก");
+
+  /* เจ้าของร้านต้องมีบันทึกไว้ดูย้อนหลัง */
+  const log = s.incidents.readDay();
+  assert.equal(log.length, 1);
+  assert.equal(log[0].fallback, "ส่งซ้ำด้วย push สำเร็จ ลูกค้าได้รับข้อความแล้ว");
+  assert.match(log[0].retry, /ไม่สำเร็จทั้ง 2 ครั้ง/, "ต้องลองใหม่ 1 ครั้งก่อนยอมแพ้");
 });
 
 test("รูปบางใบโหลดไม่ขึ้น → ส่งเท่าที่ส่งได้ ไม่ล้มทั้งก้อน", async () => {
@@ -695,4 +756,244 @@ test("Claim 4b) claim ใหม่หลัง revoke → ของที่ค�
   await s.say(s.claims.issue().code);
   assert.equal(s.reports.spoolSize(), 0, `ของที่ค้าง ${queued} ชิ้นต้องไหลเข้ามาให้ครบ`);
   assert.match(s.reportsTo(CUSTOMER).join("\n"), /เกินเพดาน/);
+});
+
+/* ═══════════ MP-08 — Acceptance ทั้ง 6 ข้อ ═══════════ */
+
+const adminTexts = (s) =>
+  s.outbox.filter((o) => o.via === "push" && o.to === ADMIN).flatMap((o) => o.messages);
+
+/* ═══ Acceptance 1 ═══ */
+test("MP08-1) force-run รายงานเย็น → schema ครบ และตัวเลขมาจาก customer-events ของวันนั้น", async () => {
+  const s = shop();
+
+  /* สร้างของจริงในวันนั้นก่อน: 2 ห้อง 3 เหตุการณ์ */
+  await s.say("บราวนี่กล่องเท่าไหร่");
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง", { type: "user", userId: "Uอีกห้อง0000000000000000000ffff" });
+
+  const rows = s.events.readDay();
+  assert.ok(rows.length >= 2, "ต้องมีเหตุการณ์ถูกบันทึกจริง");
+  const roomCount = new Set(rows.map((r) => r.suffix)).size;
+
+  await s.say("force-run-evening-report", { type: "user", userId: ADMIN });
+
+  const report = adminTexts(s).map((m) => m.text).find((t) => t.includes("รายงานเย็น"));
+  assert.ok(report, "แอดมินต้องได้รายงาน");
+
+  /* ครบ 6 หัวข้อตามลำดับ */
+  let cursor = -1;
+  for (const h of ["ลูกค้าใหม่", "Lead แยกเกรด", "เคสต้องตามด่วน", "คำถามยอดฮิต", "คำถามที่ตอบไม่ได้", "สิ่งที่เจ้าของต้องทำต่อ"]) {
+    const at = report.indexOf(h);
+    assert.ok(at > cursor, `หัวข้อ "${h}" ผิดลำดับหรือหายไป`);
+    cursor = at;
+  }
+
+  /* ตัวเลขต้องตรงกับไฟล์ ไม่ใช่เลขลอย */
+  assert.ok(report.includes(`${roomCount} ห้อง (${rows.length} เหตุการณ์)`), `ตัวเลขไม่ตรงกับไฟล์:\n${report}`);
+  assert.match(report, /\[สั่งรันเอง\]/);
+});
+
+test("MP08-1b) วันที่ไม่มีข้อมูล → บอกว่าไม่มี ห้ามสร้างตัวเลข", async () => {
+  const s = shop();
+  await s.say("force-run-evening-report --date 2020-01-01", { type: "user", userId: ADMIN });
+
+  const report = adminTexts(s).map((m) => m.text).find((t) => t.includes("รายงานเย็น"));
+  assert.match(report, /วันนี้ยังไม่มีบทสนทนาใหม่/);
+  assert.match(report, /2020-01-01/, "ต้องเป็นวันที่ที่สั่ง");
+  assert.match(report, /สิ่งที่เจ้าของต้องทำต่อ/);
+});
+
+test("MP08-1c) ก่อน claim → รายงานเย็นต้องไม่ยิงเข้าห้องลูกค้า", async () => {
+  const s = shop({ withAdmin: false });
+  await s.say("บราวนี่กล่องเท่าไหร่");
+
+  const before = s.reportsTo(CUSTOMER).length;
+  await s.pipeline.recordEvent({ chatId: CUSTOMER, intent: "ask_price", lead: "warm" });
+  const res = await (await import("../src/evening-report.js")).runEveningReport({ events: s.events, reports: s.reports, testRun: true });
+
+  assert.equal(res.deliver, "local", "ยังไม่มีแอดมิน ต้องเป็น local");
+  assert.equal(s.reportsTo(CUSTOMER).length, before, "ห้ามยิงเข้าห้องลูกค้า");
+  assert.ok(s.reports.spoolSize() > 0, "ต้องเก็บเข้าคิวไว้");
+});
+
+/* ═══ Acceptance 2 ═══ */
+test("MP08-2) ขอส่วนลด 20% → รักษาเพดาน + แจ้งด่วนถึงเจ้าของครั้งเดียว", async () => {
+  const s = shop();
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง ลด 20% ได้ไหมคะ");
+
+  /* ลูกค้าต้องไม่ได้ส่วนลดและไม่ได้ยินตัวเลขเพดาน */
+  assert.equal(s.store.list()[0].status, STATUS.DRAFT, "เกินเพดานต้องคง draft");
+  assert.ok(!/5%|เพดาน/.test(s.said()), "ห้ามบอกตัวเลขเพดานให้ลูกค้ารู้");
+
+  const urgent = adminTexts(s).map((m) => m.text).filter((t) => t.includes("ต่อรองเกินเพดาน"));
+  assert.equal(urgent.length, 1, `ต้องแจ้งครั้งเดียว แต่ได้ ${urgent.length} ครั้ง`);
+  assert.match(urgent[0], /ต้องทำต่อ:/, "ต้องบอกว่าเจ้าของต้องทำอะไร");
+
+  /* กวาดซ้ำอีกกี่รอบก็ต้องไม่แจ้งซ้ำ */
+  await s.urgent.tick();
+  await s.urgent.tick();
+  assert.equal(adminTexts(s).map((m) => m.text).filter((t) => t.includes("ต่อรองเกินเพดาน")).length, 1);
+});
+
+/* ═══ Acceptance 3 ═══ */
+test("MP08-3) ส่งรูป → ถามยืนยันระบุ quote_id+ยอด → ตอบ ใช่ → รับสลิปแล้ว + เจ้าของได้รูปจริง", async () => {
+  const s = shop();
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง");
+  const id = s.store.list()[0].quote_id;
+  await s.say(`ยืนยันสั่งซื้อ ${id}`);
+
+  await s.sendImage();
+
+  /* ยังห้ามแตะสถานะ */
+  assert.equal(s.store.get(id).status, STATUS.SENT, "ก่อนลูกค้าตอบ ใช่ สถานะห้ามขยับ");
+  const asked = s.said();
+  assert.ok(asked.includes(id), "คำถามยืนยันต้องระบุ quote_id");
+  assert.ok(asked.includes("189.00"), "และต้องระบุยอด");
+
+  await s.say("ใช่ค่ะ");
+
+  assert.equal(s.store.get(id).status, STATUS.SLIP);
+  assert.notEqual(s.store.get(id).status, STATUS.PAID, "ห้ามข้ามไปยืนยันชำระแล้วเด็ดขาด");
+
+  /* เจ้าของร้านต้องได้รูปจริง ไม่ใช่ชื่อไฟล์ */
+  const toOwner = adminTexts(s);
+  const image = toOwner.find((m) => m.type === "image");
+  assert.ok(image, "ต้องแนบรูปจริง");
+  assert.match(image.originalContentUrl, /\/media\/[0-9a-f]{32}\.jpg\?e=\d+&s=/, "ต้องเป็นลิงก์ที่เซ็นไว้");
+  assert.ok(toOwner.some((m) => (m.text ?? "").includes(id)), "และต้องบอกว่าเป็นใบไหน");
+});
+
+/* ═══ Acceptance 4 ═══ */
+test("MP08-4) 3 บับเบิลห่างกัน 2 วิ → 1 intent 1 คำตอบ", async () => {
+  const s = shop({ askBrain: async () => "ได้ค่ะ" });
+
+  /* ยิงเข้า inbox ติด ๆ กันโดยยังไม่ flush — จำลองลูกค้าพิมพ์รัว */
+  for (const t of ["สนใจบราวนี่", "กล่อง 6 ชิ้น", "ส่งพรุ่งนี้ได้ไหม"]) {
+    await s.pipeline.handleEvent({
+      type: "message", message: { type: "text", text: t },
+      replyToken: `b${t}`, source: { type: "user", userId: CUSTOMER },
+    });
+  }
+  assert.equal(s.inbox.size, 1, "3 บับเบิลต้องรวมเป็นชุดเดียว");
+
+  const before = s.toCustomer().length;
+  await s.inbox.flushAll();
+
+  assert.equal(s.toCustomer().length - before, 1, "ต้องได้คำตอบเดียว");
+  const rows = s.events.readDay();
+  assert.equal(rows.length, 1, "และนับเป็น 1 intent ไม่ใช่ 3");
+});
+
+test("MP08-4b) fault 5 แบบ — ลูกค้าไม่เห็นศัพท์ระบบ และมี incident ครบ", async () => {
+  const cases = [
+    ["model", "สมองร้านล่ม"],
+    ["timeout", "ปลายทางค้าง"],
+    ["brain", "อ่านสมองร้านไม่ได้"],
+    ["reply_token", "reply token หมดอายุ"],
+    ["line_api", "LINE ล่ม"],
+  ];
+
+  for (const [fault, label] of cases) {
+    const s = shop({ withAdmin: false, allowFaults: true, askBrain: async () => "ปกติค่ะ" });
+    assert.equal(s.faults.enable(fault).ok, true, `เปิด ${fault} ไม่ได้`);
+
+    await s.say("ร้านเปิดกี่โมงคะ");
+
+    /* ทุกข้อความที่ลูกค้าได้รับต้องไม่มีศัพท์ระบบ */
+    for (const m of s.toCustomer()) {
+      const t = m.text ?? m.altText ?? "";
+      assert.ok(!hasSystemTerms(t), `[${label}] ลูกค้าเห็นศัพท์ระบบ: ${t}`);
+    }
+
+    /* line_api ทำให้ส่งไม่ออกเลย จึงไม่มีข้อความให้ตรวจ แต่ต้องมี incident */
+    const log = s.incidents.readDay();
+    assert.ok(log.length >= 1, `[${label}] ต้องมี incident บันทึกไว้`);
+    assert.ok(log[0].retry && log[0].fallback && log[0].next_action, `[${label}] incident ต้องครบ`);
+  }
+});
+
+/* ═══ Acceptance 5 ═══ */
+test("MP08-5) รูปทั่วไป (ไม่มีใบค้าง) → ห้ามพูดคำว่า สลิป/ยอด และสถานะการเงินไม่เปลี่ยน", async () => {
+  const s = shop();
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง"); // ใบนี้ยังเป็น "ส่งลูกค้า" จากการส่งการ์ด
+  const id = s.store.list()[0].quote_id;
+  s.store.advance(id, STATUS.SLIP); // ทำให้ไม่เข้าเกณฑ์ (ไม่ใช่ "ส่งลูกค้า" แล้ว)
+
+  const before = s.store.get(id).status;
+  const seen = s.toCustomer().length;
+  await s.sendImage();
+
+  /* ดูเฉพาะข้อความที่ตอบ "รูป" ไม่ใช่ทั้งบทสนทนา — ข้อความใบเสนอราคาก่อนหน้ามีคำว่ายอดอยู่แล้วโดยชอบ */
+  const answer = s.toCustomer().slice(seen).map((m) => m.text ?? m.altText ?? "").join("\n");
+  assert.match(answer, /รับรูปไว้แล้วนะคะ/);
+  assert.ok(!MONEY_WORDS.test(answer), `ห้ามมีคำเรื่องเงินในคำตอบของรูป: ${answer}`);
+  assert.equal(s.store.get(id).status, before, "สถานะการเงินห้ามเปลี่ยน");
+});
+
+test("MP08-5.1) มีใบค้างแล้วตอบ ไม่ใช่ → สถานะไม่เปลี่ยน เจ้าของได้รูปเป็นเคสทั่วไป", async () => {
+  const s = shop();
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง");
+  const id = s.store.list()[0].quote_id;
+
+  await s.sendImage();
+  await s.say("ไม่ใช่ค่ะ");
+
+  assert.equal(s.store.get(id).status, STATUS.SENT, "ตอบไม่ใช่ = ห้ามแตะสถานะ");
+  const toOwner = adminTexts(s);
+  assert.ok(toOwner.some((m) => /ไม่ใช่เอกสารการโอน/.test(m.text ?? "")), "เจ้าของต้องได้เป็นเคสทั่วไป");
+  assert.ok(toOwner.some((m) => m.type === "image"), "และต้องได้รูปจริง");
+});
+
+test("MP08-5.2) เงียบเกิน 10 นาที → สถานะไม่เปลี่ยน · เจ้าของได้รูป unclassified · กลับมาต้องถามใหม่", async () => {
+  let clock = 0;
+  const s = shop({ slipClock: () => clock });
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง");
+  const id = s.store.list()[0].quote_id;
+
+  await s.sendImage();
+  clock += CONFIRM_TTL_MS; // ลูกค้าเงียบไป 10 นาที
+
+  await s.pipeline.sweepSlipWaiters();
+
+  assert.equal(s.store.get(id).status, STATUS.SENT, "เงียบ ≠ ใช่");
+  assert.ok(adminTexts(s).some((m) => /ไม่ได้ตอบยืนยันภายใน 10 นาที/.test(m.text ?? "")), "เจ้าของต้องได้เป็น unclassified");
+
+  /* กลับมาตอบ "ใช่" ทีหลังต้องไม่ผูกใบให้เอง */
+  await s.say("ใช่ค่ะ");
+  assert.equal(s.store.get(id).status, STATUS.SENT, "คำยืนยันที่มาหลังหมดเวลาต้องไม่ผูกใบย้อนหลัง");
+
+  /* ส่งรูปใหม่ต้องเริ่มถามยืนยันใหม่ */
+  await s.sendImage();
+  assert.ok(s.said().includes(id), "ส่งรูปใหม่ต้องถามยืนยันใหม่ตั้งแต่ต้น");
+});
+
+/* ═══ Acceptance 6 ═══ */
+test("MP08-6) มีใบค้าง 2 ใบ → ต้องให้เลือกก่อน แล้วยืนยันด้วย quote_id+ยอดของใบที่เลือก", async () => {
+  const s = shop();
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง");
+  await s.say("ขอใบเสนอราคา ชิโอะปัง 3 ชิ้น");
+  const ids = s.store.list().map((q) => q.quote_id);
+  assert.equal(ids.length, 2, "ต้องมีใบค้าง 2 ใบ");
+
+  await s.sendImage();
+
+  const picker = s.said();
+  for (const id of ids) assert.ok(picker.includes(id), `รายการให้เลือกขาดใบ ${id}`);
+  assert.ok(!/ใช่ไหมคะ/.test(picker), "ยังไม่ควรถามยืนยัน ต้องให้เลือกใบก่อน");
+
+  /* เลือกใบที่สอง */
+  const chosen = s.store.get(ids[1]);
+  await s.say(`เลือก ${chosen.quote_id}`);
+
+  const asked = s.said();
+  assert.ok(asked.includes(chosen.quote_id), "คำถามยืนยันต้องเป็นใบที่เลือก");
+  assert.ok(asked.includes(formatBaht(chosen.deposit)), "และยอดต้องตรงใบที่เลือก");
+
+  await s.say("ใช่ค่ะ");
+  assert.equal(s.store.get(chosen.quote_id).status, STATUS.SLIP);
+  assert.equal(s.store.get(ids[0]).status, STATUS.SENT, "ใบที่ไม่ได้เลือกต้องไม่ถูกแตะ");
 });

@@ -19,16 +19,20 @@
  */
 
 import { TTL_MINUTES, adminClaims } from "../src/admin-claim.js";
+import { FAULTS, FAULT_TTL_MS, createFaultBox } from "../src/faults.js";
 import { createReports } from "../src/reports.js";
 
-const [command] = process.argv.slice(2);
+const [command, faultArg] = process.argv.slice(2);
+
+/* คำสั่ง fault รับชื่อ fault ได้ 1 ตัว — คำสั่งอื่นห้ามมีพารามิเตอร์ (กันรหัสหลุดเข้า argv) */
+const TAKES_ARG = new Set(["fault"]);
 
 /*
  * กันพลาดแบบที่เจ็บที่สุด: มีคนเผลอพิมพ์รหัสต่อท้ายคำสั่ง
  * ถ้าเกิดขึ้นแปลว่ารหัสนั้นอยู่ใน shell history และใน argv ไปแล้ว ถือว่าเสียแล้ว
  * ต้องบอกให้รู้ตัวทันที ไม่ใช่ปล่อยผ่านเพราะ "คำสั่งก็ยังทำงานได้อยู่"
  */
-if (process.argv.length > 3) {
+if (process.argv.length > 3 && !TAKES_ARG.has(command)) {
   console.error("❌ คำสั่งนี้ไม่รับพารามิเตอร์เพิ่ม");
   console.error("   ถ้าเพิ่งพิมพ์รหัสต่อท้ายไป รหัสนั้นอยู่ใน shell history แล้ว");
   console.error("   ให้ถือว่ารหัสนั้นใช้ไม่ได้ แล้วออกใบใหม่ด้วย: admin-tool.mjs issue");
@@ -91,6 +95,43 @@ switch (command) {
     showStatus();
     break;
 
+  /*
+   * สวิตช์จำลองความพัง — สำหรับ Customer Test เท่านั้น
+   * ดูเหตุผลของด่านทั้ง 4 ชั้นใน src/faults.js
+   */
+  case "fault": {
+    const box = createFaultBox({ claims: adminClaims });
+
+    if (!faultArg || faultArg === "status") {
+      const st = box.status();
+      console.log("\n🧪 ตัวจำลองความพัง");
+      console.log(`   เปิดใช้ได้ไหม : ${st.allowed ? "ได้ (ตั้ง ALLOW_FAULT_INJECTION=1 ไว้)" : "ไม่ได้ — ต้องตั้ง ALLOW_FAULT_INJECTION=1"}`);
+      console.log(`   มีแอดมินอยู่  : ${st.blockedByAdmin ? "มี → เปิดไม่ได้ (โหมดใช้งานจริง)" : "ไม่มี"}`);
+      console.log(`   เปิดอยู่ตอนนี้ : ${st.active ? `${st.active} (เหลือ ${st.secondsLeft} วิ)` : "ไม่มี (ปิดอยู่)"}`);
+      console.log("\n   แบบที่เลือกได้:");
+      for (const [id, label] of Object.entries(FAULTS)) console.log(`     ${id.padEnd(12)} ${label}`);
+      console.log(`\n   เปิด: admin-tool.mjs fault <ชื่อ>   ·   ปิด: admin-tool.mjs fault off`);
+      console.log(`   เปิดแล้วดับเองใน ${FAULT_TTL_MS / 60000} นาที\n`);
+      break;
+    }
+
+    if (faultArg === "off") {
+      const { had } = box.disable();
+      console.log(had ? `\n🧪 ปิด fault "${had}" แล้ว\n` : "\n🧪 ไม่มี fault เปิดอยู่\n");
+      break;
+    }
+
+    const res = box.enable(faultArg);
+    if (!res.ok) {
+      console.error(`\n❌ เปิดไม่ได้: ${res.reason}\n`);
+      process.exit(1);
+    }
+    console.log(`\n🧪 เปิด fault "${res.fault}" แล้ว — ${FAULTS[res.fault]}`);
+    console.log(`   ดับเองใน ${res.ttlMs / 60000} นาที · ปิดเองได้ด้วย: admin-tool.mjs fault off`);
+    console.log("   ⚠️  ระหว่างนี้ลูกค้าจริงจะเจอของพังด้วย — ใช้เฉพาะตอนทดสอบเท่านั้น\n");
+    break;
+  }
+
   default:
     console.log(`
 เครื่องมือผู้ดูแล — สิทธิ์แอดมินของบอท LINE
@@ -99,6 +140,8 @@ switch (command) {
                  รหัสเก่าที่ยังไม่ถูกใช้จะถูกยกเลิกทันที
   status         ดูว่ามีแอดมินหรือยัง รายงานไปไหน และมีอะไรค้างคิว
   revoke-admin   ถอนสิทธิ์ · รายงานกลับเป็น deliver=local · ยกเลิกรหัสที่ค้าง
+  fault [ชื่อ]   ตัวจำลองความพังสำหรับ Customer Test (ไม่ใส่ชื่อ = ดูสถานะ · off = ปิด)
+                 ต้องตั้ง ALLOW_FAULT_INJECTION=1 และต้องยังไม่มีแอดมิน claim
 
 ไม่มีคำสั่งไหนรับรหัสเป็นพารามิเตอร์ และไม่มีคำสั่งขอดูรหัสเดิมซ้ำ
 `);

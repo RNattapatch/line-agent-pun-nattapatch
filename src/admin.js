@@ -38,6 +38,12 @@ export const COMMANDS = [
    * ระบบจริงของแต่ละงานสร้างใน MP-08 — อันนี้พิสูจน์แค่ว่าเมื่อของถูกส่ง มันถึงแอดมินจริง
    */
   { name: "test-reports", re: /^ทดสอบรายงาน\s*$/i },
+  /*
+   * สั่งรันรายงานเย็นเอง — เรียก code path เดียวกับ scheduler เป๊ะ ๆ
+   * ถ้าแยกกัน วันหนึ่งจะมีคนแก้ฝั่งหนึ่งแล้วลืมอีกฝั่ง แล้วรายงานที่เจ้าของร้าน
+   * สั่งทดสอบเองจะหน้าตาไม่เหมือนรายงานที่ส่งจริงทุกเย็น = ทดสอบแล้วไม่ได้พิสูจน์อะไร
+   */
+  { name: "force-evening", re: /^force-run-evening-report(?:\s+--date\s+(\d{4}-\d{2}-\d{2}))?\s*$/i },
 ];
 
 /* ข้อความนี้หน้าตาเหมือนคำสั่งแอดมินไหม (ไม่สนว่าใครพิมพ์) */
@@ -45,7 +51,10 @@ export function parseCommand(input) {
   const text = String(input ?? "").trim();
   for (const { name, re } of COMMANDS) {
     const m = text.match(re);
-    if (m) return { name, quoteId: m[1] ?? null };
+    if (!m) continue;
+    /* คำสั่งรายงานเย็นรับ "วันที่" ไม่ใช่ "เลขใบ" — เก็บคนละช่องกันไม่ให้ปนกัน */
+    if (name === "force-evening") return { name, date: m[1] ?? null, quoteId: null };
+    return { name, quoteId: m[1] ?? null };
   }
   return null;
 }
@@ -84,7 +93,7 @@ export const NOT_ADMIN_REPLY =
  * ตอบสั้น ๆ ว่าห้องนี้ไม่ตอบเรื่องขาย แทนที่จะเงียบ — เงียบแล้วเจ้าของร้านจะนึกว่าบอทตาย
  */
 export const ADMIN_ONLY_REPLY =
-  "ห้องนี้เป็นช่องทางผู้ดูแลค่ะ ไม่ตอบคำถามฝั่งขายนะคะ\nคำสั่งที่ใช้ได้: อนุมัติใบเสนอ · ปฏิเสธใบเสนอ · ดูใบเสนอ · ใบเสนอวันนี้ · ยืนยันยอด · ทดสอบรายงาน";
+  "ห้องนี้เป็นช่องทางผู้ดูแลค่ะ ไม่ตอบคำถามฝั่งขายนะคะ\nคำสั่งที่ใช้ได้: อนุมัติใบเสนอ · ปฏิเสธใบเสนอ · ดูใบเสนอ · ใบเสนอวันนี้ · ยืนยันยอด · ทดสอบรายงาน · force-run-evening-report";
 
 const day = (d = new Date()) =>
   `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
@@ -148,6 +157,11 @@ export function runCommand(command, { store, approver = "admin" } = {}) {
         reply: `🧪 ยิงข้อความจำลองของงานรายงานทั้ง ${Object.keys(REPORT_JOBS).length} แบบให้แล้วค่ะ`,
         testReports: Object.keys(REPORT_JOBS),
       };
+    }
+
+    case "force-evening": {
+      /* ผู้เรียก (pipeline) เป็นคนรันจริง เพราะที่นี่ไม่รู้จัก events/reports */
+      return { reply: null, forceEvening: { date: command.date } };
     }
 
     case "today": {

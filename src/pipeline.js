@@ -13,6 +13,18 @@
 import { HTTPFetchError } from "@line/bot-sdk";
 
 import { CLAIM, adminClaims, looksLikeCode } from "./admin-claim.js";
+import { classify } from "./classify.js";
+import { HANDOFF_REPLY, RECOVERED_REPLY, SLOW_REPLY } from "./safe-reply.js";
+import {
+  CONFIRM_NO_RE,
+  CONFIRM_YES_RE,
+  NEUTRAL_IMAGE_REPLY,
+  PICK_QUOTE_RE,
+  acceptSlip,
+  classifyImage,
+  confirmQuestion,
+} from "./slip-flow.js";
+import { SLIP_REPLY as SLIP_ACK } from "./payment-flow.js";
 import { NOT_ADMIN_REPLY, ADMIN_ONLY_REPLY, isAdminLane, parseCommand, runCommand } from "./admin.js";
 import { handleQrRequest, parsePostback } from "./payment-flow.js";
 import { NO_IMAGE_REPLY, browseReply, buildReply } from "./reply.js";
@@ -46,10 +58,45 @@ export function createPipeline({
   adminGroupId,
   claims = adminClaims,
   reports,
+  events,
+  urgent,
+  incidents,
+  faults,
+  media,
+  slipWaiters,
+  fetchImage,
+  runEvening,
   askBrain = async () => null,
   verifyImageUrl = async () => true,
   logFailure = (label, err) => console.error(`${label}:`, err),
 }) {
+  /*
+   * agent.api_max_retries = 2 → ยิงครั้งแรก 1 + ลองใหม่ 1 = 2 ครั้ง แล้วหยุด
+   *
+   * จงใจไม่วนมากกว่านี้: ปลายทางที่ล่มจริงจะไม่กลับมาภายในไม่กี่วินาที
+   * การวนต่อมีแต่ทำให้ลูกค้ารอนานขึ้นจนเลยหน้าต่างตอบกลับของ LINE
+   * แล้วสุดท้ายก็ตอบไม่ได้อยู่ดี — แถมยังเปลืองโควตาปลายทางในจังหวะที่มันกำลังแย่
+   */
+  const MAX_ATTEMPTS = 2;
+
+  async function attempt(label, fn) {
+    let last;
+    for (let i = 1; i <= MAX_ATTEMPTS; i++) {
+      try {
+        return { ok: true, value: await fn(), attempts: i };
+      } catch (err) {
+        last = err;
+        if (i < MAX_ATTEMPTS) console.warn(`↻ ${label} ไม่สำเร็จ ลองใหม่อีกครั้ง (${i}/${MAX_ATTEMPTS})`);
+      }
+    }
+    return { ok: false, error: last, attempts: MAX_ATTEMPTS };
+  }
+
+  const retryWord = (r) => (r.ok ? (r.attempts > 1 ? `สำเร็จตอนลองครั้งที่ ${r.attempts}` : "สำเร็จตั้งแต่ครั้งแรก") : `ไม่สำเร็จทั้ง ${r.attempts} ครั้ง`);
+
+  /* บันทึกเหตุขัดข้อง — ไม่มีก็ไม่พัง (เทสต์บางชุดไม่ได้ต่อตัวนี้มา) */
+  const incident = (args) => incidents?.record(args);
+
   /*
    * "ห้ามส่งการ์ดสินค้า" ครบทั้ง 3 ข้อของโจทย์:
    *   ก+ข  อยู่ใน src/conversation.js (event ล่าสุดเป็นรูป / มีคำจำพวก โอนแล้ว-สลิป-ชำระ)
@@ -219,41 +266,235 @@ export function createPipeline({
     `⚠️ ส่ง QR ให้ลูกค้าไม่สำเร็จ (LINE ไม่รับข้อความ) รบกวนส่งช่องทางชำระเงินให้เองค่ะ ${quoteId}`;
 
   /*
-   * ลูกค้าส่งรูปเข้ามา — รูปสลิปไม่ใช่ความสนใจสินค้า
-   * ทิ้งการ์ดที่ค้างคิวของห้องนี้ทันที แล้วถ้ามีใบเสนอราคาสถานะ "ส่งลูกค้า" ค้างอยู่
-   * ให้เลื่อนเป็น "รับสลิปแล้ว" และเรียกคนมาตรวจยอดจริงในแอปธนาคาร
+   * ลูกค้าส่งรูปเข้ามา
+   *
+   * ═══ รูปเพียงลำพังห้ามเปลี่ยนสถานะการเงิน ═══
+   * ตรงนี้ทำได้แค่ 3 อย่าง: เก็บรูปไว้ · ถามลูกค้าว่าเป็นของใบไหน · ส่งรูปให้เจ้าของดู
+   * สถานะใบจะขยับก็ต่อเมื่อลูกค้าตอบ "ใช่" เองเท่านั้น (ดู handleSlipAnswer)
+   *
+   * ลูกค้าที่ไม่มีใบค้างจะได้ข้อความกลาง ๆ ที่ "ไม่มีคำว่า สลิป/ยอด/ชำระ" อยู่เลย
+   * เพราะพูดไปแล้วลูกค้าจะเข้าใจว่าร้านรับเรื่องการโอนไว้แล้ว ทั้งที่ยังไม่มีอะไรเกิดขึ้น
    */
   async function handleCustomerImage(event, chatId) {
     dispatcher.drop(chatId);
 
-    let result = null;
+    const lineUserId = event.source?.userId ?? chatId;
+    let verdict;
     try {
-      result = handleSlip({ store, chatId, lineUserId: event.source?.userId ?? chatId });
+      verdict = classifyImage({ store, lineUserId });
     } catch (err) {
-      logFailure("ตรวจสลิปไม่สำเร็จ", err);
+      logFailure("ตรวจรูปที่ลูกค้าส่งมาไม่สำเร็จ", err);
+      await deliver(event.replyToken, [{ type: "text", text: NEUTRAL_IMAGE_REPLY }], chatId);
+      return;
     }
-    if (!result) return;
 
-    await deliver(event.replyToken, result.messages, chatId);
-    /* สลิปมีงานรายงานของตัวเอง แยกจาก "แจ้งด่วน" เพื่อให้เจ้าของร้านกรองดูเฉพาะเรื่องเงินได้ */
-    if (result.escalate) await notifyAdmin(result.escalate, event, "slip");
+    /* เก็บรูปลง VPS ก่อนเสมอ ไม่ว่าจะผูกกับใบได้หรือไม่ — รูปที่หายไปเอาคืนไม่ได้ */
+    const saved = await storeImage(event, chatId, verdict);
+
+    await deliver(event.replyToken, verdict.messages, chatId);
+
+    if (verdict.kind === "neutral") {
+      /* เคสทั่วไป: ส่งรูปให้เจ้าของดู โดยไม่แตะสถานะการเงินและไม่เรียกมันว่าสลิป */
+      await sendImageToOwner(saved, { chatId, note: "ลูกค้าส่งรูปเข้ามา (ไม่มีใบเสนอราคาค้างอยู่)", job: "urgent" });
+      return;
+    }
+
+    /* มีใบค้าง → พักคำถามไว้รอคำตอบ 10 นาที */
+    slipWaiters?.ask(chatId, { mediaId: saved?.id ?? null, quotes: verdict.quotes.map((q) => q.quote_id) });
+  }
+
+  /* ดาวน์โหลดรูปจาก LINE มาเก็บไว้ — คืน metadata หรือ null ถ้าเก็บไม่ได้ */
+  async function storeImage(event, chatId, verdict) {
+    if (!media || !fetchImage) return null;
+    const res = await attempt("ดาวน์โหลดรูปจาก LINE", () => fetchImage(event.message.id));
+    if (!res.ok) {
+      logFailure("ดาวน์โหลดรูปจากลูกค้าไม่สำเร็จ", res.error);
+      incident({ chatId, failure: "line_api", retry: retryWord(res), fallback: "ไม่มีรูปให้เจ้าของร้านดู" });
+      return null;
+    }
+    try {
+      return media.save(res.value, {
+        chatSuffix: String(chatId).slice(-4),
+        quoteId: verdict.kind === "confirm" ? verdict.quotes[0].quote_id : null,
+        state: "unmatched",
+      });
+    } catch (err) {
+      logFailure("เก็บรูปลงดิสก์ไม่สำเร็จ", err);
+      return null;
+    }
   }
 
   /*
-   * ส่งข้อความหาลูกค้า + จำไว้ว่าร้านพูดอะไรไป (ใช้ย้อนบริบทตอนลูกค้าถาม "มีรูปไหม")
+   * ส่งรูปจริงให้เจ้าของร้าน — ไม่ใช่ชื่อไฟล์
    *
-   * remember:false ใช้กับบทสนทนาเรื่องสิทธิ์ผู้ดูแล — ทั้งฝั่งถามและฝั่งตอบต้องไม่เข้าความจำ
-   * ความจำบทสนทนาถูกส่งต่อให้สมองร้านเป็นบริบท ซึ่งวิ่งออกไปนอกเครื่อง
-   * เรื่องสิทธิ์ของร้านไม่มีเหตุผลอะไรที่ต้องไปอยู่ตรงนั้น
+   * LINE จะเข้ามาดึงรูปจาก URL ที่เซ็นไว้ (อายุสั้น ใช้ได้ไม่กี่ครั้ง ดู src/media.js)
+   * ส่งเสร็จปิด token ทิ้งทันที ไฟล์ต้นฉบับยังอยู่บน VPS
    */
-  async function deliver(replyToken, messages, chatId, { remember = true } = {}) {
+  async function sendImageToOwner(saved, { chatId, note, quoteId = null, job = "slip" } = {}) {
+    const suffix = String(chatId).slice(-4);
+    const header = [note, `ห้อง …${suffix}`, quoteId ? `ใบเสนอราคา ${quoteId}` : null].filter(Boolean).join("\n");
+
+    if (!saved || !media) {
+      await reports?.submit(job, `${header}\n(รูปเก็บไม่สำเร็จ — รบกวนขอรูปจากลูกค้าอีกครั้ง)`);
+      return;
+    }
+
+    const path = media.signedPath(saved.id);
+    const url = path && baseUrl?.startsWith("https://") ? `${baseUrl.replace(/\/+$/, "")}${path}` : null;
+
+    if (!url) {
+      await reports?.submit(job, `${header}\n(ส่งรูปให้ดูในแชทไม่ได้ รูปอยู่บนเซิร์ฟเวอร์แล้ว)`);
+      return;
+    }
+
+    await reports?.submit(job, header);
     try {
-      await client.replyMessage({ replyToken, messages });
+      const to = claims.currentAdmin();
+      if (to) await client.pushMessage({ to, messages: [{ type: "image", originalContentUrl: url, previewImageUrl: url }] });
     } catch (err) {
-      // ดักตรงนี้เอง ไม่ปล่อยขึ้นไปให้ inbox — จะได้ log แบบสั้นเหมือนทางอื่น
-      logFailure("ตอบลูกค้าไม่สำเร็จ", err);
+      logFailure("ส่งรูปให้เจ้าของร้านไม่สำเร็จ", err);
+    } finally {
+      /* ปิดลิงก์ทันทีที่ส่งเสร็จ ไม่รอให้หมดอายุเอง */
+      media.revoke(saved.id);
+    }
+  }
+
+  /*
+   * ลูกค้าตอบคำถามยืนยันสลิป — "ใช่" / "ไม่ใช่" / "เลือก <quote_id>"
+   * คืน true เมื่อจัดการแล้ว เพื่อให้ผู้เรียกหยุดไม่ต้องเดินท่อปกติต่อ
+   */
+  async function handleSlipAnswer(text, { chatId, replyToken, event }) {
+    const waiting = slipWaiters?.pending(chatId);
+    if (!waiting) return false;
+
+    const picked = text.match(PICK_QUOTE_RE);
+    if (picked) {
+      const quoteId = picked[1].toUpperCase();
+      if (!waiting.quotes.includes(quoteId)) return false;
+      const quote = store.get(quoteId);
+      slipWaiters.ask(chatId, { mediaId: waiting.mediaId, quotes: [quoteId] });
+      await deliver(replyToken, [confirmAfterPick(quote)], chatId);
+      return true;
+    }
+
+    if (CONFIRM_NO_RE.test(text)) {
+      slipWaiters.clear(chatId);
+      await deliver(replyToken, [{ type: "text", text: NEUTRAL_IMAGE_REPLY }], chatId);
+      await sendImageToOwner(waiting.mediaId ? media?.meta(waiting.mediaId) : null, {
+        chatId,
+        note: "ลูกค้าส่งรูปเข้ามาแต่บอกว่าไม่ใช่เอกสารการโอน",
+        job: "urgent",
+      });
+      return true;
+    }
+
+    if (!CONFIRM_YES_RE.test(text)) return false;
+
+    /* ตอบ "ใช่" แล้วเท่านั้น สถานะถึงขยับ — และขยับได้แค่เป็น "รับสลิปแล้ว" */
+    if (waiting.quotes.length !== 1) {
+      await deliver(replyToken, [{ type: "text", text: "รบกวนเลือกใบที่โอนมาก่อนนะคะ" }], chatId);
+      return true;
+    }
+
+    const quoteId = waiting.quotes[0];
+    slipWaiters.clear(chatId);
+    const res = acceptSlip(quoteId, { store });
+
+    if (!res.ok) {
+      await deliver(replyToken, [{ type: "text", text: SLIP_ACK }], chatId);
+      await notifyAdmin(`ลูกค้ายืนยันสลิปของ ${quoteId} แต่เลื่อนสถานะไม่ได้: ${res.error}`, event);
+      return true;
+    }
+
+    if (waiting.mediaId) media?.link(waiting.mediaId, { quoteId, state: "matched" });
+    await deliver(replyToken, [{ type: "text", text: SLIP_ACK }], chatId);
+
+    await sendImageToOwner(waiting.mediaId ? media?.meta(waiting.mediaId) : null, {
+      chatId,
+      quoteId,
+      note: `💸 ลูกค้ายืนยันว่าเป็นเอกสารการโอนของ ${quoteId}`,
+      job: "slip",
+    });
+    await recordEvent({
+      chatId,
+      intent: "send_image",
+      lead: "hot",
+      handoff: `ลูกค้ายืนยันสลิปของ ${quoteId}`,
+      nextStep: `เช็กยอดในแอปธนาคารแล้วพิมพ์ ยืนยันยอด ${quoteId}`,
+      triggers: ["slip_in"],
+    });
+    return true;
+  }
+
+  /*
+   * กวาดคำถามยืนยันที่ลูกค้าเงียบเกิน 10 นาที
+   *
+   * เงียบไม่เท่ากับ "ใช่" — ตรงกันข้าม เงียบคือสิ่งที่เราตีความแทนลูกค้าไม่ได้เลย
+   * จึงส่งรูปให้เจ้าของร้านเป็นเคสทั่วไป (unclassified) โดยไม่แตะสถานะการเงิน
+   * แล้วปล่อยให้คนตัดสินใจ ถ้าลูกค้ากลับมายืนยันทีหลังจะเริ่มถามใหม่ตั้งแต่ต้น
+   * ไม่ผูกใบให้เองย้อนหลัง
+   */
+  async function sweepSlipWaiters() {
+    const stale = slipWaiters?.expired() ?? [];
+    for (const w of stale) {
+      await sendImageToOwner(w.mediaId ? media?.meta(w.mediaId) : null, {
+        chatId: w.chatId,
+        note: "ลูกค้าส่งรูปเข้ามาแล้วไม่ได้ตอบยืนยันภายใน 10 นาที (ยังไม่ผูกกับใบเสนอราคา)",
+        job: "urgent",
+      });
+    }
+    return stale.length;
+  }
+
+  /* ถามยืนยันอีกรอบหลังลูกค้าเลือกใบแล้ว — ต้องระบุ quote_id กับยอดของใบที่เลือกเสมอ */
+  const confirmAfterPick = (quote) => confirmQuestion(quote);
+
+  async function deliver(replyToken, messages, chatId, { remember = true } = {}) {
+    /* จำลอง "reply token หมดอายุ" — ทำให้ reply พังเพื่อพิสูจน์ว่าทางกู้ด้วย push ใช้ได้จริง */
+    const forceTokenFail = faults?.active("reply_token");
+    const forceLineDown = faults?.active("line_api");
+
+    const res = await attempt("ตอบลูกค้า", async () => {
+      if (forceLineDown) throw new Error("จำลอง: LINE ไม่รับข้อความ");
+      if (forceTokenFail) throw new Error("จำลอง: reply token หมดอายุ");
+      return client.replyMessage({ replyToken, messages });
+    });
+
+    if (res.ok) {
+      if (remember) {
+        for (const m of messages) {
+          conversations.remember(chatId, { role: "shop", kind: "text", text: m.text ?? m.altText ?? "" });
+        }
+      }
+      return true;
+    }
+
+    logFailure("ตอบลูกค้าไม่สำเร็จ", res.error);
+
+    /*
+     * reply ไม่ผ่านแล้วต้องไม่จบแค่ log
+     *
+     * reply token ของ LINE มีอายุจำกัด ลูกค้าที่พิมพ์ยาวรัวจนชนเพดานรอ
+     * อาจได้ token ที่หมดอายุพอดี ถ้าปล่อยไว้ = ลูกค้านั่งรอคำตอบที่ไม่มีวันมา
+     * ทางกู้คือ push ซึ่งไม่ต้องใช้ token (แลกกับการกินโควตารายเดือน — คุ้มกว่าเสียลูกค้า)
+     */
+    const rescue = await attempt("ส่งซ้ำด้วย push", async () => {
+      if (forceLineDown) throw new Error("จำลอง: LINE ไม่รับข้อความ");
+      return client.pushMessage({ to: chatId, messages: [{ type: "text", text: RECOVERED_REPLY }, ...messages] });
+    });
+
+    incident({
+      chatId,
+      failure: forceTokenFail ? "reply_token" : "line_api",
+      retry: retryWord(res),
+      fallback: rescue.ok ? "ส่งซ้ำด้วย push สำเร็จ ลูกค้าได้รับข้อความแล้ว" : "ส่งไม่ถึงลูกค้าเลย ต้องตามเอง",
+    });
+
+    if (!rescue.ok) {
+      await notifyAdmin(`⚠️ ส่งข้อความหาลูกค้าห้อง …${String(chatId).slice(-4)} ไม่สำเร็จ รบกวนตามเองค่ะ`, { source: { userId: chatId } });
       return false;
     }
+
     if (remember) {
       for (const m of messages) {
         conversations.remember(chatId, { role: "shop", kind: "text", text: m.text ?? m.altText ?? "" });
@@ -265,6 +506,12 @@ export function createPipeline({
   async function handleBatch({ chatId, texts, replyToken, event, reason }) {
     const text = combine(texts);
     if (!text) return;
+
+    /* คำถามที่ระบบตอบไม่ได้ — ไปโผล่ในหัวข้อ "คำถามที่ตอบไม่ได้" ของรายงานเย็น */
+    let unansweredQuestion = null;
+
+    /* เหตุแจ้งด่วนที่ได้จากฝั่งใบเสนอราคา (เกินเพดาน / ยอดสูง) */
+    let quoteTriggers = { triggers: [], nextStep: null };
 
     if (texts.length > 1) {
       console.log(`💬 รวม ${texts.length} บับเบิลเป็นข้อความเดียว (${reason})`);
@@ -299,6 +546,13 @@ export function createPipeline({
       await deliver(replyToken, [{ type: "text", text: ADMIN_ONLY_REPLY }], chatId, { remember: false });
       return;
     }
+
+    /*
+     * ── ลูกค้ากำลังตอบคำถามยืนยันสลิปอยู่ ──
+     * ต้องมาก่อนท่อปกติ ไม่งั้น "ใช่ค่ะ" จะถูกส่งเข้าสมองร้านแล้วตอบมั่ว
+     * และคำตอบที่หายไปแปลว่าสถานะใบไม่ขยับทั้งที่ลูกค้ายืนยันแล้ว
+     */
+    if (await handleSlipAnswer(text, { chatId, replyToken, event })) return;
 
     /* ── ช่องทางที่ 2: ลูกค้ากดปุ่ม "ยืนยันสั่งซื้อ" บนการ์ดใบเสนอราคา ── */
     const confirm = text.match(CONFIRM_RE);
@@ -380,6 +634,7 @@ export function createPipeline({
         });
         messages = result.messages;
         escalate = result.escalate;
+        if (result.triggers?.length) quoteTriggers = { triggers: result.triggers, nextStep: result.nextStep };
       } catch (err) {
         // ออกใบไม่ได้ก็ยังต้องมีคนตามลูกค้าต่อ — ข้อความสำรองจาก buildReply ยังอยู่
         logFailure("ออกใบเสนอราคาไม่สำเร็จ", err);
@@ -395,10 +650,26 @@ export function createPipeline({
      * พอสำหรับเวลาพัก 7 วิ บวกเพดาน 12 วิของ askBrain
      */
     if (reply.askBrain) {
-      const answer = await askBrain(text);
-      if (answer) {
-        messages = [{ type: "text", text: answer }];
+      const res = await attempt("ถามสมองร้าน", async () => {
+        if (faults?.active("model")) throw new Error("จำลอง: สมองร้านล่ม");
+        if (faults?.active("timeout")) throw new Error("จำลอง: ปลายทางค้างจนหมดเวลา");
+        if (faults?.active("brain")) throw new Error("จำลอง: อ่านไฟล์สมองร้านไม่ได้");
+        return askBrain(text);
+      });
+
+      if (res.ok && res.value) {
+        messages = [{ type: "text", text: res.value }];
         escalate = null;
+      } else if (!res.ok) {
+        /*
+         * สมองร้านล่ม → ลูกค้าต้องไม่เห็นว่าอะไรพัง แต่ต้องรู้ว่าเรื่องยังอยู่
+         * และต้องมีคนตามต่อจริง ๆ ไม่ใช่แค่ขอโทษแล้วจบ
+         */
+        const failure = faults?.active("brain") ? "brain" : faults?.active("timeout") ? "timeout" : "model";
+        messages = [{ type: "text", text: failure === "timeout" ? SLOW_REPLY : HANDOFF_REPLY }];
+        escalate = `ตอบคำถามลูกค้าไม่ได้ (ห้อง …${String(chatId).slice(-4)}) รบกวนเข้าไปตอบเองค่ะ`;
+        incident({ chatId, failure, retry: retryWord(res), fallback: "ตอบข้อความกลาง ๆ แล้วส่งต่อให้คน" });
+        unansweredQuestion = text;
       }
     }
 
@@ -414,6 +685,25 @@ export function createPipeline({
     } finally {
       if (escalate) await notifyAdmin(escalate, event);
       queueCardIntent(chatId, text, reply);
+
+      /*
+       * บันทึกเหตุการณ์ไว้ให้ยามทั้งสองตัว — ทำท้ายสุดเสมอ
+       * ต้องรู้ผลของรอบนี้ครบก่อน (ตอบได้ไหม · ต้องส่งต่อไหม · ติด trigger อะไร)
+       * ไม่งั้นรายงานเย็นจะนับเหตุการณ์ที่ยังไม่รู้ผล
+       */
+      await recordEvent({
+        chatId,
+        ...classify(text, {
+          quoteRequest: Boolean(reply.quoteRequest),
+          card: Boolean(reply.card),
+          cards: Boolean(reply.cards),
+          confirmOrder: Boolean(confirm),
+        }),
+        handoff: escalate ? escalate.split("\n")[0].slice(0, 120) : null,
+        unanswered: unansweredQuestion,
+        nextStep: quoteTriggers.nextStep,
+        triggersExtra: quoteTriggers.triggers,
+      });
     }
   }
 
@@ -442,7 +732,25 @@ export function createPipeline({
     const result = runCommand(command, { store, approver: event?.source?.userId ?? "admin" });
     if (!result) return;
 
-    await deliver(replyToken, [{ type: "text", text: result.reply }], chatId);
+    /*
+     * สั่งรันรายงานเย็นเอง — ผ่านตัวเดียวกับที่ scheduler เรียกทุกเย็น
+     * ติดป้าย testRun ไว้ให้เจ้าของร้านแยกออกว่าฉบับนี้มาจากการสั่งทดสอบ ไม่ใช่รอบจริง
+     */
+    if (result.forceEvening) {
+      if (!runEvening) {
+        await deliver(replyToken, [{ type: "text", text: "ยังต่อยามรายงานเย็นไม่เสร็จค่ะ" }], chatId);
+        return;
+      }
+      const res = await runEvening({ date: result.forceEvening.date ?? undefined, testRun: true });
+      await deliver(
+        replyToken,
+        [{ type: "text", text: `🌆 สั่งรันรายงานเย็นของ ${res.date} แล้วค่ะ (${res.count} เหตุการณ์ · deliver=${res.deliver})` }],
+        chatId,
+      );
+      return;
+    }
+
+    if (result.reply) await deliver(replyToken, [{ type: "text", text: result.reply }], chatId);
 
     /*
      * ยิงข้อความจำลองของงานรายงานทั้ง 4 แบบ ผ่านเส้นทางส่งจริงทุกขั้น
@@ -483,6 +791,36 @@ export function createPipeline({
   }
 
   /*
+   * บันทึก 1 เหตุการณ์ลงคิว แล้วปลุกยามแจ้งด่วนทันทีถ้ามี trigger
+   *
+   * ═══ ทำไมปลุกทันที ทั้งที่ยามกวาดทุก 2 นาทีอยู่แล้ว ═══
+   * รอบกวาดคือ "ตาข่ายกันตกหล่น" ไม่ใช่ช่องทางหลัก — เรื่องด่วนควรถึงเจ้าของร้านในไม่กี่วินาที
+   * ไม่ใช่รอถึง 2 นาที ส่วน dedupe key ทำให้ปลุกทันทีแล้วกวาดซ้ำอีกรอบก็ยังแจ้งครั้งเดียวอยู่ดี
+   */
+  async function recordEvent({ triggersExtra = [], triggers = [], ...rest } = {}) {
+    if (!events) return null;
+
+    const all = [...new Set([...triggers, ...triggersExtra])];
+    let record = null;
+    try {
+      record = events.append({ ...rest, triggers: all });
+    } catch (err) {
+      logFailure("บันทึกเหตุการณ์ลูกค้าไม่สำเร็จ", err);
+      return null;
+    }
+
+    if (all.length > 0 && urgent) {
+      try {
+        await urgent.tick();
+      } catch (err) {
+        /* กวาดรอบ 2 นาทีจะเก็บตกให้เอง ไม่ต้องทำให้การตอบลูกค้าพังตาม */
+        logFailure("ยามแจ้งด่วนทำงานไม่สำเร็จ", err);
+      }
+    }
+    return record;
+  }
+
+  /*
    * ส่งต่อแอดมิน — ลง log เสมอ แล้วเข้าตัวส่งรายงาน (src/reports.js)
    *
    * ตัวส่งรายงานเป็นคนตัดสินว่าจะถึงมือแอดมินเลย หรือเก็บเข้าคิวไว้ก่อน
@@ -504,5 +842,5 @@ export function createPipeline({
     }
   }
 
-  return { handleEvent, handleBatch, inPaymentContext, pushProductCard, notifyAdmin };
+  return { handleEvent, handleBatch, inPaymentContext, pushProductCard, notifyAdmin, sweepSlipWaiters, recordEvent };
 }

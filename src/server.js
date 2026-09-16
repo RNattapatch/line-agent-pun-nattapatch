@@ -10,14 +10,22 @@ import {
 import { loadDotEnv } from "./env.js";
 import { IMAGE_DIR, readCache } from "./image-cache.js";
 import { askBrain, loadBrain } from "./brain.js";
-import { DEFAULT_DELAY_MS, createInbox } from "./inbox.js";
+import { DEFAULT_DELAY_MS, DEFAULT_MAX_WAIT_MS, createInbox } from "./inbox.js";
 import { conversations } from "./conversation.js";
 import { TICK_MS, createCardDispatcher } from "./card-dispatcher.js";
 import { verifyImageUrl } from "./image-verify.js";
 import { createPipeline } from "./pipeline.js";
 import { adminClaims } from "./admin-claim.js";
+import { createEventLog } from "./customer-events.js";
+import { createIncidentLog } from "./incidents.js";
+import { createFaultBox } from "./faults.js";
+import { createMediaStore, readStream } from "./media.js";
 import { paymentDestinations, qrDestinations } from "./payment.js";
 import { createReports } from "./reports.js";
+import { createScheduler } from "./scheduler.js";
+import { createSlipWaiters } from "./slip-flow.js";
+import { createUrgentGuard } from "./urgent-guard.js";
+import { runEveningReport } from "./evening-report.js";
 import { qrDir } from "./qr-issue.js";
 import { quoteStore } from "./quotes.js";
 
@@ -34,6 +42,7 @@ const {
 
 /* เวลาที่รอให้ลูกค้าพิมพ์จบก่อนตอบ — ปรับได้ทาง .env โดยไม่ต้องแก้โค้ด */
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS) || DEFAULT_DELAY_MS;
+const REPLY_MAX_WAIT_MS = Number(process.env.REPLY_MAX_WAIT_MS) || DEFAULT_MAX_WAIT_MS;
 
 if (!CHANNEL_ACCESS_TOKEN || !CHANNEL_SECRET) {
   console.error("ขาด CHANNEL_ACCESS_TOKEN หรือ CHANNEL_SECRET — คัดลอก .env.example เป็น .env ก่อน");
@@ -55,6 +64,12 @@ const client = new messagingApi.MessagingApiClient({
   channelAccessToken: CHANNEL_ACCESS_TOKEN,
 });
 
+/* ตัวดึงไฟล์ที่ลูกค้าส่งมา — คนละ client กับตัวส่งข้อความ (คนละ endpoint ของ LINE) */
+const blobClient = new messagingApi.MessagingApiBlobClient({
+  channelAccessToken: CHANNEL_ACCESS_TOKEN,
+});
+const fetchImage = async (messageId) => readStream(await blobClient.getMessageContent(messageId));
+
 /*
  * อ่านแคชรูปครั้งเดียวตอนบูต ไม่อ่านซ้ำทุกข้อความ
  * เปลี่ยนรูปใหม่ (npm run gen:images) แล้วต้องรีสตาร์ตเซิร์ฟเวอร์ — เขียนไว้ใน README แล้ว
@@ -74,7 +89,10 @@ if (!process.env.OPENROUTER_API_KEY) {
   console.log(`🧠 โหลดสมองร้าน ${brainChars.toLocaleString()} ตัวอักษร`);
 }
 
-console.log(`⏳ รอลูกค้าพิมพ์จบ ${(REPLY_DELAY_MS / 1000).toFixed(0)} วินาที ก่อนตอบ`);
+console.log(
+  `⏳ รอลูกค้าพิมพ์จบ ${(REPLY_DELAY_MS / 1000).toFixed(0)} วินาที ก่อนตอบ ` +
+    `(เพดานรวม ${(REPLY_MAX_WAIT_MS / 1000).toFixed(0)} วินาที)`,
+);
 
 /*
  * ใบเสนอราคาจริงอยู่นอก repo เสมอ (~/shop-data/quotes โหมด 700 · ไฟล์ 600)
@@ -98,6 +116,24 @@ try {
 }
 
 const reports = createReports({ push: (args) => client.pushMessage(args) });
+const events = createEventLog();
+const urgent = createUrgentGuard({ events, reports });
+const incidents = createIncidentLog();
+const faults = createFaultBox({ claims: adminClaims });
+const media = createMediaStore();
+const slipWaiters = createSlipWaiters();
+
+/*
+ * กวาดของเก่าตอนบูต — ทำที่นี่ครั้งเดียว แล้วรายงานเย็นกวาดซ้ำทุกวัน
+ * ของที่เลย retention แล้วต้องหายจริง ๆ ไม่ใช่ค้างอยู่เพราะไม่มีใครรันตัวกวาด
+ */
+for (const [what, n] of [
+  ["เหตุการณ์ลูกค้า", events.sweep()],
+  ["บันทึกเหตุขัดข้อง", incidents.sweep()],
+  ["รูปที่ลูกค้าส่งมา", media.sweep()],
+]) {
+  if (n > 0) console.log(`🧹 ลบ${what}ที่เกินกำหนดเก็บแล้ว ${n} รายการ`);
+}
 const claimStatus = adminClaims.status();
 
 if (claimStatus.hasAdmin) {
@@ -155,6 +191,27 @@ app.use(
   }),
 );
 
+/*
+ * เสิร์ฟรูปที่ลูกค้าส่งมา ให้เซิร์ฟเวอร์ของ LINE เข้ามาดึงไปแสดงในแชทเจ้าของร้าน
+ *
+ * ไม่ใช่ static — ทุกคำขอต้องมีลายเซ็นที่ยังไม่หมดอายุและยังไม่ถูกใช้จนครบ (ดู src/media.js)
+ * และไม่มี index ให้ไล่ดูทั้งโฟลเดอร์
+ */
+app.get("/media/:file", (req, res) => {
+  const id = String(req.params.file).split(".")[0];
+  const verdict = media.resolve(id, { expires: req.query.e, signature: req.query.s });
+
+  if (!verdict.ok) {
+    /* ทุกเหตุตอบ 404 เหมือนกันหมด — ไม่บอกว่าไฟล์มีอยู่จริงไหม */
+    console.warn(`🖼  ปฏิเสธคำขอรูป (${verdict.reason})`);
+    return res.status(404).end();
+  }
+
+  res.setHeader("Content-Type", verdict.type);
+  res.setHeader("Cache-Control", "no-store");
+  return res.sendFile(verdict.file);
+});
+
 // health check สำหรับ uptime monitor / platform ที่ deploy อยู่
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
@@ -196,6 +253,7 @@ function logFailure(label, err) {
  */
 const inbox = createInbox({
   delayMs: REPLY_DELAY_MS,
+  maxWaitMs: REPLY_MAX_WAIT_MS,
   /* ห่อไว้ในฟังก์ชัน เพราะ pipeline ถูกสร้างทีหลัง (มันต้องรู้จัก inbox ตัวนี้) */
   onFlush: (batch) => pipeline.handleBatch(batch),
 });
@@ -226,6 +284,14 @@ const pipeline = createPipeline({
   adminGroupId: ADMIN_GROUP_ID,
   claims: adminClaims,
   reports,
+  events,
+  urgent,
+  incidents,
+  faults,
+  media,
+  slipWaiters,
+  fetchImage,
+  runEvening: ({ date, testRun } = {}) => runEveningReport({ events, reports, date, testRun }),
   askBrain,
   verifyImageUrl,
   logFailure,
@@ -256,6 +322,23 @@ dispatcher.start();
 console.log(`🗂  ตัวส่งการ์ดตื่นทุก ${(TICK_MS / 1000).toFixed(0)} วินาที`);
 
 /*
+ * ยามรายงานเย็น + ยามแจ้งด่วน
+ * catchUp() ต้องมาก่อน start() — ถ้า deploy หลังเวลารายงานของวันนั้นไปแล้ว
+ * รายงานของวันนั้นจะหายไปเงียบ ๆ ถ้าไม่มีใครรันตามให้
+ */
+const scheduler = createScheduler({
+  runEvening: ({ date, testRun }) => runEveningReport({ events, reports, date, testRun }),
+  urgentTick: async () => {
+    await urgent.tick();
+    await pipeline.sweepSlipWaiters();
+  },
+});
+scheduler.catchUp().then((r) => {
+  if (r.caughtUp) console.log(`🌆 ส่งรายงานเย็นของ ${r.date} ตามให้แล้ว (เลยเวลาไปตอนเซิร์ฟเวอร์ปิดอยู่)`);
+});
+scheduler.start();
+
+/*
  * ตอนรีสตาร์ต (deploy ใหม่) จะมีลูกค้าที่ข้อความยังพักอยู่ในคิว
  * ถ้าดับเลยลูกค้ากลุ่มนั้นจะไม่ได้รับคำตอบและไม่มีใครรู้ — ตอบให้จบก่อนค่อยดับ
  */
@@ -263,6 +346,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, async () => {
     console.log(`ได้รับ ${signal} — ตอบข้อความที่ค้างอยู่ ${inbox.size} ชุดก่อนปิด`);
     dispatcher.stop();
+    scheduler.stop();
     server.close();
     try {
       await inbox.flushAll();
