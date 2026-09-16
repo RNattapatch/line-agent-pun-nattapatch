@@ -15,6 +15,8 @@ import { conversations } from "./conversation.js";
 import { TICK_MS, createCardDispatcher } from "./card-dispatcher.js";
 import { verifyImageUrl } from "./image-verify.js";
 import { createPipeline } from "./pipeline.js";
+import { paymentDestinations, qrDestinations } from "./payment.js";
+import { qrDir } from "./qr-issue.js";
 import { quoteStore } from "./quotes.js";
 
 loadDotEnv();
@@ -87,10 +89,49 @@ if (!ADMIN_USER_ID && !ADMIN_GROUP_ID) {
   console.warn("⚠️  ไม่ได้ตั้ง ADMIN_USER_ID / ADMIN_GROUP_ID — คำสั่งอนุมัติใบเสนอราคาจะใช้ไม่ได้เลย");
 }
 
+/*
+ * ช่องทางรับเงิน — นับให้ดูตอนบูต ไม่พิมพ์เลขบัญชีออก log เด็ดขาด
+ * ขาดไปไม่ทำให้บอทดับ แค่ลูกค้าที่กดยืนยันสั่งซื้อจะถูกส่งต่อให้แอดมินแจ้งช่องทางเอง
+ */
+const destinations = paymentDestinations();
+if (destinations.length === 0) {
+  console.warn(
+    "⚠️  ไม่ได้ตั้ง PAYMENT_DESTINATIONS_JSON — ลูกค้าที่กดยืนยันสั่งซื้อจะถูกส่งต่อให้แอดมินแจ้งช่องทางเอง",
+  );
+} else {
+  /* ส่งลิสต์ที่แกะแล้วเข้าไป ไม่เรียก paymentDestinations() ซ้ำ — ไม่งั้น warning ของรายการที่กรอกผิดจะขึ้นสองรอบ */
+  const names = destinations.map((d) => d.label).join(" · ");
+  console.log(
+    `💳 ช่องทางรับเงิน ${destinations.length} ช่อง: ${names} (ออก QR ได้ ${qrDestinations(destinations).length} ช่อง)`,
+  );
+}
+
 const app = express();
 
 // เสิร์ฟรูปสินค้าให้ LINE มาโหลด — เป็นไฟล์นิ่ง ไม่มีข้อมูลลูกค้า
 app.use("/images", express.static(IMAGE_DIR, { maxAge: "7d" }));
+
+/*
+ * เสิร์ฟภาพ QR ให้ LINE มาโหลด — คนละโฟลเดอร์กับรูปสินค้าโดยสิ้นเชิง
+ * (รูปสินค้าอยู่ใน repo · ภาพ QR อยู่ที่ ~/shop-data/qr นอก repo เหมือนใบเสนอราคา)
+ *
+ * ชื่อไฟล์เป็นสตริงสุ่ม 32 ตัวจาก crypto.randomBytes เดาไม่ได้ (ดู src/qr-issue.js)
+ * ตรงนี้จึงไม่มีการตรวจสิทธิ์ — และตรวจไม่ได้ด้วย เพราะคนที่มาโหลดคือเซิร์ฟเวอร์ของ LINE
+ * ไม่ใช่ตัวลูกค้า จะไม่มี session ให้ตรวจ
+ *
+ * แนบ "ห้ามแคช" ไว้ให้ตัวกลางระหว่างทาง: ภาพนี้ผูกกับยอดของใบเดียว ใช้ครั้งเดียว
+ * และถูกกวาดทิ้งใน 24 ชม. — ไม่มีเหตุผลให้ใครเก็บสำเนาไว้
+ */
+app.use(
+  "/qr",
+  express.static(qrDir(), {
+    maxAge: 0,
+    etag: false,
+    index: false,
+    dotfiles: "deny",
+    setHeaders: (res) => res.setHeader("Cache-Control", "no-store"),
+  }),
+);
 
 // health check สำหรับ uptime monitor / platform ที่ deploy อยู่
 app.get("/healthz", (_req, res) => res.json({ ok: true }));

@@ -1,0 +1,33 @@
+{
+  "type": "bubble",
+  "size": "mega",
+  "header": {
+    "type": "box",
+    "layout": "vertical",
+    "backgroundColor": "#8C6A3F",
+    "paddingAll": "12px",
+    "contents": [
+      { "type": "text", "text": "ช่องทางชำระเงิน", "color": "#FFFFFF", "weight": "bold", "size": "sm" },
+      { "type": "text", "text": "{{quote_id}}", "color": "#FFFFFF", "size": "xs" }
+    ]
+  },
+  "body": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": [
+      { "type": "box", "layout": "vertical", "spacing": "xs", "contents": "{{amounts}}" },
+      { "type": "separator", "margin": "md" },
+      { "type": "text", "text": "ชื่อบัญชีผู้รับเงิน", "size": "xxs", "color": "#999999", "margin": "md" },
+      { "type": "text", "text": "{{account_name}}", "size": "sm", "weight": "bold", "color": "#333333", "wrap": true },
+      { "type": "box", "layout": "vertical", "spacing": "md", "margin": "md", "contents": "{{destinations}}" },
+      { "type": "text", "text": "โอนแล้วส่งสลิปเข้ามาในแชทนี้ได้เลยค่ะ ทางร้านจะตรวจยอดแล้วยืนยันกลับมานะคะ", "size": "xxs", "color": "#999999", "margin": "md", "wrap": true }
+    ]
+  },
+  "footer": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": "{{buttons}}"
+  }
+}

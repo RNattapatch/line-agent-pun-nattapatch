@@ -13,6 +13,7 @@
 import { HTTPFetchError } from "@line/bot-sdk";
 
 import { NOT_ADMIN_REPLY, isAdminLane, parseCommand, runCommand } from "./admin.js";
+import { handleQrRequest, parsePostback } from "./payment-flow.js";
 import { NO_IMAGE_REPLY, browseReply, buildReply } from "./reply.js";
 import { productCard } from "./cards.js";
 import { bySlug, matchProduct } from "./products.js";
@@ -67,11 +68,21 @@ export function createPipeline({
   }
 
   async function handleEvent(event) {
-    if (event.type !== "message") return;
+    if (event.type !== "message" && event.type !== "postback") return;
 
     // กลุ่ม/ห้องใช้ id ของกลุ่ม ไม่งั้นข้อความจากคนละคนในกลุ่มเดียวกันจะแยกชุดกันจนตอบมั่ว
     const chatId = event.source?.groupId ?? event.source?.roomId ?? event.source?.userId;
     if (!chatId) return;
+
+    /*
+     * ── ปุ่มบนการ์ดช่องทางชำระเงิน ──
+     * ไม่ผ่าน inbox (ตัวพักข้อความ 7 วิ) โดยตั้งใจ — การกดปุ่มคือเจตนาที่จบในตัวแล้ว
+     * ไม่ใช่บับเบิลที่ต้องรอดูว่าลูกค้าจะพิมพ์ต่ออะไร และลูกค้าที่กดขอ QR กำลังรอภาพอยู่
+     */
+    if (event.type === "postback") {
+      await handlePostbackEvent(event, chatId);
+      return;
+    }
 
     /*
      * ข้อความที่ไม่ใช่ตัวอักษร (รูป สติกเกอร์ ไฟล์) ไม่ได้ตอบ แต่ "ต้องจำ"
@@ -88,6 +99,58 @@ export function createPipeline({
     conversations.remember(chatId, { role: "customer", kind: "text", text: event.message.text });
     inbox.add(chatId, { text: event.message.text.trim(), replyToken: event.replyToken, event });
   }
+
+  /*
+   * ลูกค้ากดปุ่มบนการ์ดช่องทางชำระเงิน
+   *
+   * lineUserId ที่ใช้ตรวจเจ้าของใบเอามาจาก event.source.userId ซึ่ง LINE เป็นคนใส่มาให้
+   * ไม่ใช่จาก postback data ที่ลูกค้ากดส่งมา — ถ้าเอาจาก data ใครก็ปลอมเป็นคนอื่นได้
+   * ไม่มี userId (กลุ่มที่ปิดการส่ง userId) = ตรวจเจ้าของใบไม่ได้ = ไม่ออก QR ให้
+   */
+  async function handlePostbackEvent(event, chatId) {
+    const parsed = parsePostback(event.postback?.data);
+    if (!parsed) return;
+
+    if (parsed.action === "rejected") {
+      await notifyAdmin(`🚨 postback ที่พกยอดมาเอง ถูกปฏิเสธ: ${parsed.reason}`, event);
+      return;
+    }
+
+    const lineUserId = event.source?.userId ?? null;
+    let result;
+    try {
+      result = handleQrRequest({
+        store,
+        quoteId: parsed.quoteId,
+        lineUserId,
+        destId: parsed.destId,
+        kind: parsed.kind,
+        baseUrl,
+      });
+    } catch (err) {
+      logFailure("ออก QR ไม่สำเร็จ", err);
+      return;
+    }
+
+    /* การกดปุ่มขอ QR เป็นบริบทชำระเงินเต็มตัว — ตัวส่งการ์ดสินค้าต้องเงียบทันที */
+    dispatcher.drop(chatId);
+    conversations.remember(chatId, { role: "customer", kind: "text", text: `ขอ QR ${parsed.quoteId}` });
+
+    const delivered = await deliver(event.replyToken, result.messages, chatId);
+    if (result.escalate) await notifyAdmin(result.escalate, event);
+    else if (!delivered) await notifyAdmin(qrNotDelivered(parsed.quoteId), event);
+  }
+
+  /*
+   * ส่งของที่เกี่ยวกับเงินไม่สำเร็จต้องมีคนรู้เสมอ
+   *
+   * deliver() ดักและกลืน error ไว้เองเพื่อให้ log สั้น ซึ่งพอสำหรับข้อความทั่วไป
+   * แต่ไม่พอสำหรับเส้นชำระเงิน: ลูกค้าเพิ่งกดปุ่มแล้วจอเงียบ เขาจะรอโดยไม่มีใครรู้
+   * และเคสที่น่ากลัวที่สุดคือ LINE ปฏิเสธการ์ดทั้งใบ (เช่น action ชนิดใหม่ที่เครื่องรุ่นเก่าไม่รู้จัก)
+   * ซึ่งจะพังเงียบทั้งที่โค้ดเราไม่มีอะไรผิดเลย
+   */
+  const qrNotDelivered = (quoteId) =>
+    `⚠️ ส่ง QR ให้ลูกค้าไม่สำเร็จ (LINE ไม่รับข้อความ) รบกวนส่งช่องทางชำระเงินให้เองค่ะ ${quoteId}`;
 
   /*
    * ลูกค้าส่งรูปเข้ามา — รูปสลิปไม่ใช่ความสนใจสินค้า
@@ -152,8 +215,14 @@ export function createPipeline({
     const confirm = text.match(CONFIRM_RE);
     if (confirm) {
       const result = handleConfirm(confirm[1], { store, chatId });
-      await deliver(replyToken, result.messages, chatId);
+      const delivered = await deliver(replyToken, result.messages, chatId);
       if (result.escalate) await notifyAdmin(result.escalate, event);
+      else if (!delivered) {
+        await notifyAdmin(
+          `⚠️ ส่งการ์ดช่องทางชำระเงินไม่สำเร็จ (LINE ไม่รับข้อความ) รบกวนแจ้งช่องทางให้ลูกค้าเองค่ะ ${confirm[1]}`,
+          event,
+        );
+      }
       return;
     }
 
@@ -285,6 +354,21 @@ export function createPipeline({
     if (!result) return;
 
     await deliver(replyToken, [{ type: "text", text: result.reply }], chatId);
+
+    /*
+     * ยืนยันยอดแล้ว → บอกลูกค้าทันที
+     * ต่างจาก "ปฏิเสธ" ที่จงใจให้คนตามเอง เพราะข่าวดีไม่ต้องมีใครมาเรียบเรียง
+     * และลูกค้าที่โอนเงินไปแล้วกำลังรออยู่ว่าร้านได้รับหรือยัง
+     */
+    if (result.customerMessages?.length && result.quote?.chat_id) {
+      try {
+        await client.pushMessage({ to: result.quote.chat_id, messages: result.customerMessages });
+        console.log(`💰 แจ้งลูกค้าว่ายืนยันชำระเงิน ${result.quote.quote_id} แล้ว`);
+      } catch (err) {
+        logFailure("แจ้งลูกค้าว่ายืนยันชำระเงินแล้วไม่สำเร็จ", err);
+        await notifyAdmin(`ยืนยัน ${result.quote.quote_id} แล้ว แต่ส่งข้อความหาลูกค้าไม่สำเร็จ รบกวนแจ้งเองค่ะ`, event);
+      }
+    }
 
     if (command.name !== "approve" || !result.quote?.chat_id) return;
 

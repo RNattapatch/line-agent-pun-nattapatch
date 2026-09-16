@@ -14,6 +14,7 @@
  * (ปลอดภัยกว่าเดาว่าใครน่าจะเป็นแอดมิน)
  */
 
+import { confirmPayment } from "./payment-flow.js";
 import { reportLine } from "./quotes.js";
 
 const QUOTE_ID = "(Q-\\d{8}-\\d{3})";
@@ -22,6 +23,13 @@ export const COMMANDS = [
   { name: "approve", re: new RegExp(`^อนุมัติใบเสนอ\\s+${QUOTE_ID}\\s*$`, "i") },
   { name: "reject", re: new RegExp(`^ปฏิเสธใบเสนอ\\s+${QUOTE_ID}\\s*$`, "i") },
   { name: "show", re: new RegExp(`^(?:ดูใบเสนอ|ใบเสนอ)\\s+${QUOTE_ID}\\s*$`, "i") },
+  /*
+   * ยืนยันว่าเงินเข้าบัญชีจริง — คำสั่งที่มีผลกับเงินมากที่สุดในไฟล์นี้
+   * จงใจไม่รับรูปแบบย่อ ("ยืนยัน Q-…" / "ok Q-…") และไม่รับยอดต่อท้าย
+   * ยอดที่ยืนยันคือยอดในใบ ไม่ใช่ยอดที่แอดมินพิมพ์ — พิมพ์ยอดมาด้วยได้เมื่อไหร่
+   * วันหนึ่งจะมีคนพิมพ์ยอดที่ไม่ตรงกับใบแล้วระบบรับไว้เงียบ ๆ
+   */
+  { name: "confirm", re: new RegExp(`^ยืนยันยอด\\s+${QUOTE_ID}\\s*$`, "i") },
   { name: "today", re: /^ใบเสนอวันนี้\s*$/i },
 ];
 
@@ -98,6 +106,16 @@ export function runCommand(command, { store, approver = "admin" } = {}) {
         .map((a) => `  ${a.at.slice(0, 19).replace("T", " ")} ${a.actor} ${a.action}${a.to ? ` → ${a.to}` : ""}`)
         .join("\n");
       return { quote, reply: `${reportLine(quote)}\nผู้อนุมัติ: ${quote.approver ?? "-"}\n${trail}` };
+    }
+
+    case "confirm": {
+      /*
+       * เส้นเดียวที่ใบกลายเป็น "ยืนยันชำระแล้ว"
+       * ใบที่ยังไม่ถึง "รับสลิปแล้ว" จะถูกปฏิเสธและเขียนร่องรอยไว้ โดยสถานะไม่ขยับ
+       * (ดูเหตุผลใน store.confirmPayment() ที่ src/quotes.js)
+       */
+      const res = confirmPayment(command.quoteId, { store, approver });
+      return { quote: res.quote, reply: res.reply, customerMessages: res.customerMessages };
     }
 
     case "today": {

@@ -9,39 +9,19 @@
  *
  * ช่องทางชำระเงินไม่ถูกส่งไปพร้อมใบเสนอราคา — context.md ข้อ 7 บอกว่า
  * "ยืนยันยอดกับลูกค้าก่อนทุกครั้งก่อนแจ้งช่องทางชำระเงิน"
- * ลูกค้าต้องกดปุ่ม "ยืนยันสั่งซื้อ" บนการ์ดก่อน ถึงจะได้เลขพร้อมเพย์กับยอดมัดจำ
+ * ลูกค้าต้องกดปุ่ม "ยืนยันสั่งซื้อ" บนการ์ดก่อน ถึงจะได้การ์ดช่องทางชำระเงิน
+ * แล้วต้องกด "ขอ QR" อีกทีถึงจะได้ภาพ QR ที่ผูกกับยอดของใบนั้น (ดู src/payment-flow.js)
  */
 
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { quoteCard } from "./cards.js";
+import { SLIP_REPLY, ownerAction, paymentMessages } from "./payment-flow.js";
 import { formatBaht } from "./price-source.js";
-import { promptPayPayload } from "./promptpay.js";
 import { STATUS, canIssueQr, canSendQuoteCard, reportLine } from "./quotes.js";
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const text = (t) => ({ type: "text", text: t });
 
 /* ปุ่ม "ยืนยันสั่งซื้อ" บนการ์ดส่งข้อความนี้กลับมา */
 export const CONFIRM_RE = /^ยืนยันสั่งซื้อ\s+(Q-\d{8}-\d{3})\s*$/i;
-
-/*
- * เลขพร้อมเพย์ของร้าน — เอาจาก PROMPTPAY_ID ก่อน ไม่มีค่อยอ่านจาก context.md ข้อ 7
- * ไม่มีทั้งสองทาง = ไม่แจ้งช่องทางชำระเงินเอง ให้คนมาแจ้ง
- * เงินที่โอนผิดบัญชีเอาคืนไม่ได้ ตรงนี้จึงยอมรบกวนแอดมินดีกว่าเดาเลขบัญชี
- */
-export function shopPromptPayId({ root = ROOT } = {}) {
-  if (process.env.PROMPTPAY_ID) return process.env.PROMPTPAY_ID;
-  try {
-    const ctx = fs.readFileSync(path.join(root, "context.md"), "utf8");
-    return ctx.match(/พร้อมเพย์\s*เบอร์\s*\*{0,2}([\d-]{9,15})\*{0,2}/)?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
 
 /*
  * ลูกค้าพิมพ์ยอดมาเอง แล้วยอดนั้นไม่ตรงกับที่คิดได้จาก products.md
@@ -136,7 +116,7 @@ export function sendQuote(quote, { store, parsed } = {}) {
  *   1. ใบนี้เป็นของห้องนี้จริงไหม — quote_id เดาได้ (Q-วันที่-เลขรัน) ถ้าไม่เช็ค
  *      ลูกค้าคนหนึ่งจะพิมพ์เลขใบของคนอื่นแล้วเห็นยอดของคนอื่นได้
  *   2. สถานะออก QR ได้ไหม — draft / หมดอายุ / ยกเลิก ห้ามออกเด็ดขาด
- *   3. มีเลขพร้อมเพย์ของร้านตั้งไว้จริงไหม
+ *   3. ตั้งช่องทางรับเงินไว้ใน ENV จริงไหม (ดู src/payment.js)
  */
 export function handleConfirm(quoteId, { store, chatId } = {}) {
   const quote = store.get(quoteId);
@@ -165,34 +145,14 @@ export function handleConfirm(quoteId, { store, chatId } = {}) {
     };
   }
 
-  const promptPayId = shopPromptPayId();
-  const payload = promptPayPayload({ phone: promptPayId, amount: quote.deposit });
-
-  if (!payload) {
-    return {
-      messages: [text("ขอให้แอดมินแจ้งช่องทางชำระเงินให้นะคะ รอสักครู่ค่ะ")],
-      escalate: `ยังไม่ได้ตั้งเลขพร้อมเพย์ของร้าน — แจ้งช่องทางชำระเงินให้ลูกค้าเองด้วยค่ะ ${quote.quote_id}`,
-      quote,
-    };
-  }
-
-  return {
-    messages: [
-      text(
-        [
-          `รับออเดอร์ค่ะ ${quote.quote_id}`,
-          `ยอดสุทธิ ${formatBaht(quote.net)} บาท`,
-          `มัดจำ ${formatBaht(quote.deposit)} บาท`,
-          `โอนพร้อมเพย์ ${promptPayId} ชื่อบัญชี ร้านขนมปังสดสดสด`,
-          "โอนแล้วส่งสลิปมาในแชทนี้ได้เลยค่ะ",
-        ].join("\n"),
-      ),
-    ],
-    escalate: null,
-    quote,
-    /* payload พร้อมให้เอาไป render เป็นภาพ QR วันที่ร้านอยากได้ — ดู src/promptpay.js */
-    qrPayload: payload,
-  };
+  /*
+   * ถึงตรงนี้แปลว่าผ่านด่านครบแล้ว — ส่งการ์ดช่องทางชำระเงิน
+   * เลขบัญชีกับชื่อผู้รับเงินมาจาก ENV เท่านั้น (ดู src/payment.js)
+   * ไม่ออก QR ให้ตั้งแต่ตรงนี้ ลูกค้าต้องกดปุ่ม "ขอ QR" บนการ์ดอีกที
+   * เพราะ QR ผูกกับยอดเดียว ออกทิ้งไว้ตั้งแต่ยังไม่มีใครขอ = ภาพค้างในแชทที่อาจถูกใช้ผิดยอดทีหลัง
+   */
+  const payment = paymentMessages(quote);
+  return { ...payment, quote };
 }
 
 /*
@@ -206,9 +166,21 @@ export function handleSlip({ store, chatId, lineUserId } = {}) {
 
   store.advance(open.quote_id, STATUS.SLIP, { actor: "bot", note: "ลูกค้าส่งรูปเข้ามา" });
 
+  /*
+   * ก่อนเจ้าของร้านตรวจยอดจริง ลูกค้าต้องได้ยินแค่ "รับสลิปแล้ว รอตรวจ" เท่านั้น
+   * ห้ามมีคำไหนที่ฟังแล้วเหมือนยืนยันว่าเงินเข้าแล้ว — บอทอ่านสลิปจากรูปไม่ได้
+   * และสลิปปลอมใช้เวลาทำไม่กี่วินาที ถ้าบอทรับปากไปก่อน ร้านจะเสียของฟรีโดยที่ลูกค้าก็ไม่ผิด
+   */
+  const current = store.get(open.quote_id);
   return {
-    messages: [text("ได้รับสลิปแล้วค่ะ ขอเช็กยอดสักครู่แล้วแจ้งกลับนะคะ")],
-    escalate: `💸 ลูกค้าส่งสลิปแล้ว รบกวนเช็คยอดในแอปธนาคาร\n${reportLine(store.get(open.quote_id))}`,
-    quote: store.get(open.quote_id),
+    messages: [text(SLIP_REPLY)],
+    escalate: [
+      "💸 ลูกค้าส่งสลิปแล้ว รบกวนเช็คยอดในแอปธนาคาร",
+      reportLine(current),
+      ownerAction(current),
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    quote: current,
   };
 }

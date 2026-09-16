@@ -12,6 +12,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
+import { BRAIN_FILES } from "../src/brain.js";
+import { paymentDestinations } from "../src/payment.js";
 import { defaultDir } from "../src/quotes.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -85,4 +87,34 @@ test("ข้อความรายงานที่ส่งออกไม�
   assert.ok(!line.includes(fullId));
   assert.ok(!LINE_USER_ID.test(line));
   assert.match(line, /…a7b8/);
+});
+
+/*
+ * ═══ เลขบัญชีต้องมาจาก ENV ทางเดียว ═══
+ *
+ * สมองร้านเอา context.md · products.md · promotions.md ไปเป็น system prompt ทั้งไฟล์
+ * ถ้าเลขพร้อมเพย์หรือเลขบัญชีไปนั่งอยู่ในไฟล์พวกนี้ สมองร้านจะพิมพ์ตอบลูกค้าได้เอง
+ * ซึ่งเท่ากับมีแหล่งเลขบัญชีที่สองที่ "แก้ได้ด้วยการแก้ข้อความ" — และเงินที่โอนผิดบัญชีเอาคืนไม่ได้
+ *
+ * ด่านนี้จึงกวาดไฟล์ที่สมองร้านอ่าน หาอะไรที่หน้าตาเหมือนเลขบัญชี/เบอร์พร้อมเพย์
+ */
+test("ไฟล์ที่สมองร้านอ่าน ต้องไม่มีเลขพร้อมเพย์หรือเลขบัญชี", () => {
+  /* เบอร์มือถือไทย · เลขบัญชีธนาคาร · เลขบัตรประชาชน 13 หลัก */
+  const patterns = [/\b0\d{1,2}-?\d{3}-?\d{4}\b/, /\b\d{3}-\d-\d{4,5}-\d\b/, /\b\d{13}\b/];
+  const offenders = [];
+
+  for (const file of BRAIN_FILES) {
+    const body = fs.readFileSync(path.join(ROOT, file), "utf8");
+    for (const re of patterns) {
+      const hit = body.match(re);
+      if (hit) offenders.push(`${file}: ${hit[0]}`);
+    }
+  }
+
+  assert.deepEqual(offenders, [], `เลขบัญชีต้องอยู่ใน ENV เท่านั้น:\n${offenders.join("\n")}`);
+});
+
+test("ไม่ได้ตั้ง ENV = ไม่มีช่องทางรับเงิน — ไม่มีเลขสำรองฝังในโค้ด", () => {
+  /* กันวันที่มีคนใส่ค่าเริ่มต้น "เผื่อไว้ก่อน" ลงไปในโค้ด ซึ่งจะกลายเป็นบัญชีที่ไม่มีใครตั้งใจใช้ */
+  assert.deepEqual(paymentDestinations({ env: {} }), []);
 });

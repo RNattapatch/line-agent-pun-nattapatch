@@ -168,6 +168,98 @@ export function quoteCard(quote) {
 }
 
 /*
+ * การ์ดช่องทางชำระเงิน — แถวละ 1 บัญชี พร้อมปุ่มคัดลอกเลข และปุ่มขอ QR
+ *
+ * ═══ ตัวเลขทุกตัวบนการ์ดนี้มาจากไหน ═══
+ *   ยอด        → record ของใบเสนอราคา (คิดจาก products.md มาตั้งแต่ต้น)
+ *   ชื่อบัญชี    → ENV เท่านั้น (ดู src/payment.js)
+ *   เลขบัญชี    → ENV เท่านั้น
+ * ไม่มีช่องไหนรับค่าจากข้อความลูกค้า และไม่มีเลขบัญชีตัวไหนเขียนอยู่ใน template
+ * (มีเทสต์ใน tests/privacy.test.js กวาด cards/ หาเบอร์โทรไว้แล้ว)
+ *
+ * ═══ ปุ่มเป็น postback ไม่ใช่ message — ต่างจากการ์ดสินค้าโดยตั้งใจ ═══
+ * การ์ดสินค้าใช้ปุ่มชนิด message เพราะอยากให้ไหลเข้าท่อเดิมและเข้าความจำบทสนทนา
+ * แต่ปุ่มขอ QR ต้องพก quote_id ไปด้วยแบบที่ลูกค้าแก้ไม่ได้ ถ้าเป็นข้อความ
+ * ลูกค้าจะพิมพ์เลขใบของคนอื่นเลียนแบบได้ทันที — postback จึงเป็นทางเดียวที่รับได้
+ */
+export function paymentCard(quote, destinations, { amountKinds = ["deposit"] } = {}) {
+  if (!Array.isArray(destinations) || destinations.length === 0) return null;
+
+  const amounts = [row("ยอดสุทธิ", `${formatBaht(quote.net)} บ.`)];
+  if (quote.deposit > 0 && quote.deposit !== quote.net) {
+    amounts.push(row(`มัดจำ ${quote.deposit_percent}%`, `${formatBaht(quote.deposit)} บ.`, {
+      weight: "bold",
+      size: "sm",
+      color: "#8C6A3F",
+    }));
+  }
+
+  /* แถวละบัญชี: ชื่อธนาคาร/ช่องทาง · เลข · ปุ่มคัดลอก */
+  const rows = destinations.map((d) => ({
+    type: "box",
+    layout: "vertical",
+    spacing: "xs",
+    contents: [
+      row(d.label, d.number, { weight: "bold", size: "sm", color: "#333333" }),
+      {
+        type: "button",
+        style: "link",
+        height: "sm",
+        /*
+         * action ชนิด clipboard ให้ลูกค้ากดแล้วเลขไปอยู่ในคลิปบอร์ดเลย ไม่ต้องจิ้มเลือกทีละตัว
+         * เลขโอนที่ลูกค้าพิมพ์ตามเองคือจุดที่พิมพ์ตกหล่นได้ และเงินที่โอนผิดเลขเอาคืนไม่ได้
+         */
+        action: { type: "clipboard", label: `คัดลอก${d.label}`, clipboardText: d.number },
+      },
+    ],
+  }));
+
+  /*
+   * ปุ่มขอ QR — 1 ปุ่มต่อ 1 (ช่องทางพร้อมเพย์ × ชนิดยอด)
+   * data พก quote_id ไปด้วยเสมอ และพก "ชนิดยอด" ไม่ใช่ตัวเลข
+   * ตัวเลขไปหยิบจาก record ตอนกดจริง (ดู src/qr-issue.js) — การ์ดที่ค้างอยู่ในแชทเมื่อวาน
+   * จึงออก QR ด้วยยอดเก่าไม่ได้ ต่อให้ใบถูกแก้ version ไปแล้ว
+   */
+  const buttons = [];
+  for (const d of destinations.filter((x) => x.type === "promptpay")) {
+    for (const kind of amountKinds) {
+      const amount = kind === "deposit" ? quote.deposit : quote.net;
+      const what = kind === "deposit" ? "มัดจำ" : "เต็มจำนวน";
+      buttons.push({
+        type: "button",
+        style: "primary",
+        height: "sm",
+        color: "#8C6A3F",
+        action: {
+          type: "postback",
+          label: `ขอ QR ${what} ${formatBaht(amount)} บ.`,
+          data: `action=qr&quote_id=${quote.quote_id}&dest=${d.id}&kind=${kind}`,
+          displayText: `ขอ QR ${what} ${quote.quote_id}`,
+        },
+      });
+    }
+  }
+
+  buttons.push({
+    type: "button",
+    style: "secondary",
+    height: "sm",
+    action: { type: "message", label: "ขอคุยกับแอดมิน", text: `ขอคุยกับแอดมินเรื่อง ${quote.quote_id}` },
+  });
+
+  const bubble = render(loadTemplate("payment-card"), {
+    quote_id: quote.quote_id,
+    account_name: destinations[0].account_name,
+    amounts,
+    destinations: rows,
+    buttons,
+  });
+
+  /* altText ห้ามมีเลขบัญชี — มันโผล่ใน notification บนหน้าล็อกสกรีน (context.md ข้อ 6) */
+  return flex(`ช่องทางชำระเงิน ${quote.quote_id}`, bubble);
+}
+
+/*
  * การ์ดหลายใบเรียงให้ปัดดู — ใช้ตอบคำขอแบบกว้าง ("ขอดูสินค้า" / "เมนู" / "มีอะไรบ้าง")
  *
  * คืน null ถ้าประกอบไม่ได้สักใบ ผู้เรียกต้องตกไปใช้ลิสต์ข้อความแทน

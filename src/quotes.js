@@ -54,7 +54,7 @@ export const HIGH_VALUE_BAHT = policy("QUOTE_HIGH_VALUE", 50_000);
 export const DEPOSIT_PERCENT = policy("QUOTE_DEPOSIT_PERCENT", 50);
 
 /* อายุใบเสนอราคา */
-export const VALID_DAYS = policy("QUOTE_VALID_DAYS", 7);
+export const VALID_DAYS = policy("QUOTE_VALID_DAYS", 3);
 
 /* ───────── สถานะ ───────── */
 
@@ -448,6 +448,39 @@ export function createQuoteStore({ dir = defaultDir(), now = () => new Date(), s
     },
 
     /*
+     * เจ้าของร้านตรวจยอดในแอปธนาคารจริงแล้วยืนยัน — จุดเดียวที่ใบกลายเป็น "ยืนยันชำระแล้ว"
+     *
+     * ═══ ทำไมต้องเป็นคน ═══
+     * บอทอ่านสลิปจากรูปไม่ได้ และสลิปปลอมมีจริง (แก้ตัวเลขในภาพใช้เวลาไม่กี่วินาที)
+     * "เงินเข้าแล้วจริง" จึงยืนยันได้จากที่เดียวคือแอปธนาคาร ซึ่งมีแต่คนเปิดดูได้
+     *
+     * ═══ ทำไมปฏิเสธแล้วยังต้องเขียน audit ═══
+     * ใบที่ยังไม่ถึง "รับสลิปแล้ว" แต่มีคนพยายามกดยืนยัน คือสัญญาณที่ต้องเห็นย้อนหลังได้
+     * ไม่ว่าจะเป็นแอดมินพิมพ์เลขใบผิด หรือมีคนพยายามดันใบให้ผ่านโดยไม่มีเงินเข้า
+     * ถ้าปฏิเสธเงียบ ๆ ความพยายามนั้นจะไม่เหลือร่องรอยเลย — สถานะไม่ขยับ แต่ร่องรอยต้องขยับ
+     */
+    confirmPayment(quoteId, approver) {
+      const record = this.get(quoteId);
+      if (!record) return { ok: false, error: "ไม่พบใบเสนอราคานี้" };
+
+      if (record.status !== STATUS.SLIP) {
+        audit(record, "confirm-rejected", { attempted_from: record.status }, approver);
+        writeRecord(record);
+        return {
+          ok: false,
+          error: `ใบนี้สถานะ "${record.status}" ยังไม่ถึงขั้นรับสลิป ยืนยันยอดไม่ได้`,
+          quote: record,
+        };
+      }
+
+      record.approver = approver;
+      audit(record, "confirm-payment", { net: record.net, deposit: record.deposit }, approver);
+      transition(record, STATUS.PAID, { actor: approver, note: "เจ้าของร้านตรวจยอดในแอปธนาคารแล้ว" });
+      writeRecord(record);
+      return { ok: true, quote: record };
+    },
+
+    /*
      * แก้ใบที่ส่งลูกค้าไปแล้ว — ห้ามทับของเดิม ต้องขึ้น version ใหม่เสมอ
      * เก็บสำเนาเดิมไว้ใน previous_versions เพื่อให้ยอดที่ลูกค้าเคยเห็นยังย้อนดูได้
      * แล้วตรวจใหม่ทั้งใบ (ราคาอาจเปลี่ยนไปแล้วตั้งแต่ครั้งก่อน)
@@ -508,9 +541,14 @@ export function createQuoteStore({ dir = defaultDir(), now = () => new Date(), s
 export const canSendQuoteCard = (quote) =>
   Boolean(quote) && [STATUS.REVIEWED, STATUS.SENT, STATUS.SLIP].includes(quote.status);
 
-/* QR ออกได้เฉพาะใบที่ผ่านการตรวจและยังไม่หมดอายุ — draft / หมดอายุ / ยกเลิก ห้ามออก */
+/*
+ * QR ออกได้เฉพาะ "ตรวจแล้ว" กับ "ส่งลูกค้า" — draft / หมดอายุ / ยกเลิก ห้ามออก
+ *
+ * "รับสลิปแล้ว" ก็ห้ามด้วย ทั้งที่ใบยังไม่ตาย: ลูกค้าโอนมาแล้วและกำลังรอเราตรวจยอด
+ * ยื่น QR ใบใหม่ให้ตอนนั้นคือชวนให้โอนซ้ำรอบสอง ซึ่งแก้ยากกว่าการให้รอคำยืนยันอีกนิด
+ */
 export const canIssueQr = (quote) =>
-  Boolean(quote) && [STATUS.REVIEWED, STATUS.SENT, STATUS.SLIP].includes(quote.status);
+  Boolean(quote) && [STATUS.REVIEWED, STATUS.SENT].includes(quote.status);
 
 /*
  * สรุปใบเสนอราคาสำหรับ "หน้ารายงาน" และแจ้งเตือนแอดมิน

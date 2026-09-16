@@ -16,6 +16,12 @@ import { STATUS, canIssueQr, createQuoteStore } from "../src/quotes.js";
 import { CONFIRM_RE, handleConfirm, handleQuoteRequest, handleSlip } from "../src/quote-flow.js";
 import { parseQuoteRequest } from "../src/quote-intent.js";
 
+/* ช่องทางรับเงินสมมติ — ระบบอ่านจาก ENV เท่านั้น (src/payment.js) */
+process.env.PAYMENT_ACCOUNT_NAME = "ร้านขนมปังสดสดสด (ทดสอบ)";
+process.env.PAYMENT_DESTINATIONS_JSON = JSON.stringify([
+  { id: "pp", type: "promptpay", label: "พร้อมเพย์", number: "099-999-9999" },
+]);
+
 const ADMIN = "Uแอดมิน00000000000000000000000000";
 const CUSTOMER = "Uลูกค้า0000000000000000000000abcd";
 
@@ -165,7 +171,7 @@ test("ของที่ไม่มีราคาใน products.md → ส่
   assert.match(result.messages[0].text, /(คะ|ค่ะ)$/);
 });
 
-test("ปุ่มยืนยันสั่งซื้อ → ได้ช่องทางชำระเงินพร้อมยอดมัดจำ", () => {
+test("ปุ่มยืนยันสั่งซื้อ → ได้การ์ดช่องทางชำระเงินพร้อมยอดมัดจำ", () => {
   const store = freshStore();
   const quote = handleQuoteRequest(parseQuoteRequest("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง"), ctx(store)).quote;
 
@@ -173,11 +179,32 @@ test("ปุ่มยืนยันสั่งซื้อ → ได้ช่
   assert.match(pressed, CONFIRM_RE);
 
   const result = handleConfirm(pressed.match(CONFIRM_RE)[1], ctx(store));
-  const said = result.messages.map((m) => m.text).join(" ");
+  const said = result.messages.map((m) => m.text ?? "").join(" ");
+  const card = result.messages.find((m) => m.type === "flex");
 
   assert.match(said, /189\.00/, "ต้องบอกยอดมัดจำ 50%");
-  assert.match(said, /พร้อมเพย์/);
-  assert.ok(result.qrPayload, "ใบที่ผ่านการตรวจแล้วออก QR ได้");
+  assert.ok(card, "ต้องได้การ์ดช่องทางชำระเงิน");
+  assert.ok(JSON.stringify(card).includes("099-999-9999"), "เลขบัญชีต้องมาจาก ENV");
+
+  /* ยังไม่ออก QR ตั้งแต่ตรงนี้ — ลูกค้าต้องกดปุ่มขอ QR อีกที */
+  assert.ok(!result.messages.some((m) => m.type === "image"), "ยังไม่ส่งภาพ QR ตอนนี้");
+});
+
+test("ไม่ได้ตั้งช่องทางรับเงินใน ENV → ไม่เดาเลขบัญชี ส่งต่อให้แอดมินแจ้ง", () => {
+  const saved = process.env.PAYMENT_DESTINATIONS_JSON;
+  delete process.env.PAYMENT_DESTINATIONS_JSON;
+  try {
+    const store = freshStore();
+    const quote = handleQuoteRequest(parseQuoteRequest("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง"), ctx(store)).quote;
+
+    const result = handleConfirm(quote.quote_id, ctx(store));
+
+    assert.ok(!result.messages.some((m) => m.type === "flex"), "ไม่มีการ์ดช่องทางชำระเงิน");
+    assert.match(result.escalate, /PAYMENT_DESTINATIONS_JSON/);
+    assert.match(result.messages[0].text, /(คะ|ค่ะ)$/);
+  } finally {
+    process.env.PAYMENT_DESTINATIONS_JSON = saved;
+  }
 });
 
 test("ยืนยันใบของคนอื่น → ไม่บอกยอด ไม่ออก QR", () => {
@@ -186,8 +213,8 @@ test("ยืนยันใบของคนอื่น → ไม่บอก
 
   const result = handleConfirm(mine.quote_id, ctx(store, "Uคนอื่น"));
 
-  assert.equal(result.qrPayload, undefined, "เดาเลขใบของคนอื่นแล้วต้องไม่เห็นยอด");
-  assert.ok(!result.messages.map((m) => m.text).join(" ").includes("378"));
+  assert.ok(!result.messages.some((m) => m.type === "flex"), "เดาเลขใบของคนอื่นแล้วต้องไม่เห็นยอด");
+  assert.ok(!JSON.stringify(result.messages).includes("378"));
   assert.match(result.escalate, /ไม่ใช่ของห้องตัวเอง/);
 });
 
@@ -196,7 +223,7 @@ test("ยืนยันใบที่ยังเป็น draft → ห้า
   const quote = handleQuoteRequest(parseQuoteRequest("ขอใบเสนอราคา บราวนี่กล่อง 400 กล่อง"), ctx(store)).quote;
 
   const result = handleConfirm(quote.quote_id, ctx(store));
-  assert.equal(result.qrPayload, undefined);
+  assert.ok(!result.messages.some((m) => m.type === "flex"), "draft ห้ามได้การ์ดช่องทางชำระเงิน");
   assert.match(result.escalate, /ยังออก QR ไม่ได้/);
 });
 
@@ -208,7 +235,7 @@ test("ยืนยันใบที่หมดอายุ → ห้ามอ
   clock = new Date("2026-09-30T10:00:00.000Z");
   const result = handleConfirm(quote.quote_id, ctx(store));
 
-  assert.equal(result.qrPayload, undefined);
+  assert.ok(!result.messages.some((m) => m.type === "flex"), "ใบหมดอายุห้ามได้การ์ดช่องทางชำระเงิน");
   assert.equal(store.get(quote.quote_id).status, STATUS.EXPIRED);
   assert.match(result.messages[0].text, /(คะ|ค่ะ)$/);
 });
