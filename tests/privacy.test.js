@@ -118,3 +118,39 @@ test("ไม่ได้ตั้ง ENV = ไม่มีช่องทาง�
   /* กันวันที่มีคนใส่ค่าเริ่มต้น "เผื่อไว้ก่อน" ลงไปในโค้ด ซึ่งจะกลายเป็นบัญชีที่ไม่มีใครตั้งใจใช้ */
   assert.deepEqual(paymentDestinations({ env: {} }), []);
 });
+
+/*
+ * ═══ รหัส claim ต้องไม่มีทางขึ้น GitHub (ข้อบังคับข้อ 5) ═══
+ *
+ * รหัสเป็น base32 32 ตัว ซึ่งหน้าตาไม่เหมือนอะไรที่ควรอยู่ในซอร์สโค้ดอยู่แล้ว
+ * ด่านนี้กวาดทุกไฟล์ที่ track อยู่ (รวมไฟล์ใหม่ที่ยังไม่ commit) หาอะไรที่หน้าตาแบบนั้น
+ *
+ * ถ้าวันหนึ่งมีคนเผลอ paste รหัสลงเทสต์เพื่อ "ให้ดีบักง่าย" ด่านนี้จะจับได้ก่อน commit
+ * — ซึ่งเป็นวินาทีสุดท้ายที่ยังแก้ทัน เพราะของที่ขึ้น GitHub แล้วอยู่ใน history ตลอดไป
+ */
+test("ไม่มีรหัส claim สิทธิ์ผู้ดูแลในไฟล์ที่ track อยู่", () => {
+  const CODE_LIKE = /\b[A-Z2-7]{32}\b/g;
+
+  /*
+   * ตัวอักษรชุด base32 เองยาว 32 ตัวพอดี จึงเข้าเงื่อนไขเดียวกับรหัส — ต้องยกเว้น
+   * ประกอบตอนรัน ไม่เขียนเป็นข้อความตรง ๆ ไม่งั้นด่านนี้จะจับไฟล์ตัวเอง
+   * (รหัสจริงเป็นค่าสุ่ม โอกาสออกมาเรียง A-Z แล้วต่อ 2-7 พอดีคือ 1 ใน 2^160)
+   */
+  const ALPHABET = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i)).join("") + "234567";
+  const offenders = [];
+
+  for (const file of trackedFiles()) {
+    const body = fs.readFileSync(path.join(ROOT, file), "utf8");
+    for (const hit of body.match(CODE_LIKE) ?? []) {
+      if (hit === ALPHABET) continue;
+      offenders.push(`${file}: ${hit.slice(0, 6)}…`);
+    }
+  }
+
+  assert.deepEqual(offenders, [], `พบสิ่งที่หน้าตาเหมือนรหัส claim:\n${offenders.join("\n")}`);
+});
+
+test("สถานะสิทธิ์ผู้ดูแลเก็บนอก repo", async () => {
+  const { adminDir } = await import("../src/admin-claim.js");
+  assert.ok(!adminDir().startsWith(ROOT + path.sep), `ต้องไม่อยู่ใน repo: ${adminDir()}`);
+});

@@ -12,7 +12,8 @@
 
 import { HTTPFetchError } from "@line/bot-sdk";
 
-import { NOT_ADMIN_REPLY, isAdminLane, parseCommand, runCommand } from "./admin.js";
+import { CLAIM, adminClaims, looksLikeCode } from "./admin-claim.js";
+import { NOT_ADMIN_REPLY, ADMIN_ONLY_REPLY, isAdminLane, parseCommand, runCommand } from "./admin.js";
 import { handleQrRequest, parsePostback } from "./payment-flow.js";
 import { NO_IMAGE_REPLY, browseReply, buildReply } from "./reply.js";
 import { productCard } from "./cards.js";
@@ -21,6 +22,17 @@ import { wantsCard } from "./quote-intent.js";
 import { CONFIRM_RE, handleConfirm, handleQuoteRequest, handleSlip, sendQuote } from "./quote-flow.js";
 import { PAYMENT_STATUSES } from "./quotes.js";
 import { combine } from "./inbox.js";
+
+/*
+ * ข้อความเดียวกันสำหรับทุกกรณีที่ claim ไม่สำเร็จ — ผิด หมดอายุ หรือใช้ไปแล้ว
+ * ถ้าแยกข้อความตามเหตุ คนที่ไล่เดารหัสจะรู้ว่า "รหัสนี้มีอยู่จริงแต่หมดอายุ" ซึ่งบอกว่าเดาถูกแล้ว
+ * เจ้าของร้านตัวจริงดูเหตุผลที่แท้จริงได้จาก `admin-tool.mjs status` อยู่แล้ว
+ */
+export const CLAIM_FAILED_REPLY =
+  "ขออภัยค่ะ รหัสนี้ใช้ไม่ได้ค่ะ หากมีเรื่องสินค้า ราคา หรือการสั่งซื้อ ยินดีตอบให้เลยค่ะ";
+
+export const CLAIM_OK_REPLY =
+  "ยืนยันสิทธิ์ผู้ดูแลเรียบร้อยแล้วค่ะ\nห้องนี้จะรับรายงานและแจ้งเตือนของร้านตั้งแต่นี้ไป และจะไม่ตอบคำถามฝั่งขายอีกนะคะ";
 
 export function createPipeline({
   client,
@@ -32,6 +44,8 @@ export function createPipeline({
   baseUrl,
   adminUserId,
   adminGroupId,
+  claims = adminClaims,
+  reports,
   askBrain = async () => null,
   verifyImageUrl = async () => true,
   logFailure = (label, err) => console.error(`${label}:`, err),
@@ -85,6 +99,26 @@ export function createPipeline({
     }
 
     /*
+     * ── รหัส claim สิทธิ์ผู้ดูแล ──
+     *
+     * ต้องดักตรงนี้ "ก่อน" conversations.remember() และก่อน inbox.add() เสมอ
+     * เพราะทุกอย่างหลังจากบรรทัดนี้จะพารหัสไปไว้ในที่ที่ไม่ควรมีมัน:
+     *   remember() → ความจำบทสนทนา ซึ่งถูกส่งต่อให้สมองร้านเป็นบริบท
+     *   inbox      → ถูกรวมกับบับเบิลอื่นแล้ว log จำนวนบับเบิล
+     *   askBrain   → ยิงข้อความออกนอกเครื่องไปที่ผู้ให้บริการโมเดล
+     *
+     * ไม่ว่ารหัสจะถูก ผิด หมดอายุ หรือเคยใช้ไปแล้ว ก็ตอบจบตรงนี้ทั้งหมด
+     * เคสที่ "ผิด" ยิ่งต้องดักให้อยู่ เพราะรหัสที่พิมพ์ผิดไปตัวเดียวก็ยังเกือบเป็นรหัสจริง
+     */
+    if (event.message.type === "text") {
+      const code = looksLikeCode(event.message.text);
+      if (code) {
+        await handleClaimAttempt(code, event, chatId);
+        return;
+      }
+    }
+
+    /*
      * ข้อความที่ไม่ใช่ตัวอักษร (รูป สติกเกอร์ ไฟล์) ไม่ได้ตอบ แต่ "ต้องจำ"
      * เพราะรูปที่ลูกค้าส่งเข้ามากลางบทสนทนามักเป็นสลิปโอนเงิน ซึ่งเปลี่ยนบริบททั้งห้อง
      * เดิมโค้ดตรงนี้ return ทิ้งตั้งแต่บรรทัดแรก ระบบเลยไม่มีทางรู้ว่าลูกค้าเพิ่งส่งสลิปมา
@@ -98,6 +132,38 @@ export function createPipeline({
 
     conversations.remember(chatId, { role: "customer", kind: "text", text: event.message.text });
     inbox.add(chatId, { text: event.message.text.trim(), replyToken: event.replyToken, event });
+  }
+
+  /*
+   * มีคนส่งอะไรที่หน้าตาเหมือนรหัส claim เข้ามา
+   *
+   * ข้อความตอบกลับตั้งใจให้เหมือนกันหมดสำหรับทุกกรณีที่ไม่สำเร็จ
+   * ถ้าแยกว่า "รหัสหมดอายุ" กับ "ไม่มีรหัสนี้" คนที่ไล่เดาจะรู้ทันทีว่าเดาถูกแล้วหรือยัง
+   *
+   * ไม่มี log บรรทัดไหนในฟังก์ชันนี้ที่แตะตัวรหัส — มีแต่ผลลัพธ์
+   */
+  async function handleClaimAttempt(code, event, chatId) {
+    const lineUserId = event.source?.userId ?? null;
+    const { result } = claims.claim(code, lineUserId);
+
+    if (result !== CLAIM.OK) {
+      console.warn(`🔐 claim ไม่สำเร็จ (${result}) จากห้อง …${String(chatId).slice(-4)}`);
+      await deliver(event.replyToken, [{ type: "text", text: CLAIM_FAILED_REPLY }], chatId, { remember: false });
+      return;
+    }
+
+    console.log(`🔐 ยกสิทธิ์ผู้ดูแลให้ LINE user …${String(lineUserId).slice(-4)} แล้ว`);
+    await deliver(event.replyToken, [{ type: "text", text: CLAIM_OK_REPLY }], chatId, { remember: false });
+
+    /*
+     * งานที่ค้างคิวไว้ตอนยังไม่มีแอดมินต้องไหลเข้ามาให้ครบ ทำทันทีหลังตอบ
+     * ทำหลังตอบเพราะคิวอาจยาว ลูกค้าไม่ควรต้องรอ reply จนกว่าจะเทคิวเสร็จ
+     */
+    try {
+      await reports?.flush();
+    } catch (err) {
+      logFailure("ส่งรายงานที่ค้างคิวไม่สำเร็จ", err);
+    }
   }
 
   /*
@@ -169,11 +235,18 @@ export function createPipeline({
     if (!result) return;
 
     await deliver(event.replyToken, result.messages, chatId);
-    if (result.escalate) await notifyAdmin(result.escalate, event);
+    /* สลิปมีงานรายงานของตัวเอง แยกจาก "แจ้งด่วน" เพื่อให้เจ้าของร้านกรองดูเฉพาะเรื่องเงินได้ */
+    if (result.escalate) await notifyAdmin(result.escalate, event, "slip");
   }
 
-  /* ส่งข้อความหาลูกค้า + จำไว้ว่าร้านพูดอะไรไป (ใช้ย้อนบริบทตอนลูกค้าถาม "มีรูปไหม") */
-  async function deliver(replyToken, messages, chatId) {
+  /*
+   * ส่งข้อความหาลูกค้า + จำไว้ว่าร้านพูดอะไรไป (ใช้ย้อนบริบทตอนลูกค้าถาม "มีรูปไหม")
+   *
+   * remember:false ใช้กับบทสนทนาเรื่องสิทธิ์ผู้ดูแล — ทั้งฝั่งถามและฝั่งตอบต้องไม่เข้าความจำ
+   * ความจำบทสนทนาถูกส่งต่อให้สมองร้านเป็นบริบท ซึ่งวิ่งออกไปนอกเครื่อง
+   * เรื่องสิทธิ์ของร้านไม่มีเหตุผลอะไรที่ต้องไปอยู่ตรงนั้น
+   */
+  async function deliver(replyToken, messages, chatId, { remember = true } = {}) {
     try {
       await client.replyMessage({ replyToken, messages });
     } catch (err) {
@@ -181,8 +254,10 @@ export function createPipeline({
       logFailure("ตอบลูกค้าไม่สำเร็จ", err);
       return false;
     }
-    for (const m of messages) {
-      conversations.remember(chatId, { role: "shop", kind: "text", text: m.text ?? m.altText ?? "" });
+    if (remember) {
+      for (const m of messages) {
+        conversations.remember(chatId, { role: "shop", kind: "text", text: m.text ?? m.altText ?? "" });
+      }
     }
     return true;
   }
@@ -200,14 +275,28 @@ export function createPipeline({
      * ต้องมาก่อนทุกอย่าง และต้องเช็ค "ห้องไหนพิมพ์" ไม่ใช่แค่ "พิมพ์ว่าอะไร"
      * คำสั่งเดียวกันที่พิมพ์จากห้องลูกค้าต้องไม่มีผล ไม่งั้นลูกค้าอนุมัติส่วนลดให้ตัวเองได้
      */
+    const admin = isAdminLane(event, { adminUserId, adminGroupId, claims });
+
     const command = parseCommand(text);
     if (command) {
-      if (!isAdminLane(event, { adminUserId, adminGroupId })) {
+      if (!admin) {
         console.warn(`🚫 คำสั่งแอดมินจากห้องที่ไม่ใช่ admin lane — ไม่มีผล: ${command.name} ${command.quoteId ?? ""}`);
         await deliver(replyToken, [{ type: "text", text: NOT_ADMIN_REPLY }], chatId);
         return;
       }
       await runAdminCommand(command, { replyToken, chatId, event });
+      return;
+    }
+
+    /*
+     * ── หนึ่ง LINE user มี role เดียว ──
+     * ห้องที่เป็นแอดมินแล้วต้องไม่ได้คำตอบฝั่งขายอีกเลย — ไม่มีการ์ดสินค้า ไม่มีใบเสนอราคา
+     * ไม่ผ่านสมองร้าน เพราะห้องนี้คือห้องที่รายงานยอดขายกับข้อมูลลูกค้าคนอื่นวิ่งเข้ามา
+     * ถ้ายังตอบขายปนอยู่ด้วย เจ้าของร้านจะแยกไม่ออกว่าข้อความไหนเป็นของลูกค้าคนไหน
+     * และบทสนทนาขายจะถูกเก็บปนกับรายงานภายในในความจำห้องเดียวกัน
+     */
+    if (admin) {
+      await deliver(replyToken, [{ type: "text", text: ADMIN_ONLY_REPLY }], chatId, { remember: false });
       return;
     }
 
@@ -356,6 +445,17 @@ export function createPipeline({
     await deliver(replyToken, [{ type: "text", text: result.reply }], chatId);
 
     /*
+     * ยิงข้อความจำลองของงานรายงานทั้ง 4 แบบ ผ่านเส้นทางส่งจริงทุกขั้น
+     * (reports.submit → เช็คว่ามีแอดมินไหม → push เข้า Admin lane)
+     * ไม่ได้ลัดไป push ตรง ๆ เพราะสิ่งที่ต้องพิสูจน์คือ "เส้นทาง" ไม่ใช่ "ส่งข้อความเป็นไหม"
+     */
+    if (result.testReports && reports) {
+      for (const job of result.testReports) {
+        await reports.submit(job, `[ข้อความจำลอง] ทดสอบเส้นทางส่งของงานนี้ — ระบบจริงสร้างใน MP-08`);
+      }
+    }
+
+    /*
      * ยืนยันยอดแล้ว → บอกลูกค้าทันที
      * ต่างจาก "ปฏิเสธ" ที่จงใจให้คนตามเอง เพราะข่าวดีไม่ต้องมีใครมาเรียบเรียง
      * และลูกค้าที่โอนเงินไปแล้วกำลังรออยู่ว่าร้านได้รับหรือยัง
@@ -383,23 +483,24 @@ export function createPipeline({
   }
 
   /*
-   * ส่งต่อแอดมิน — ลง log เสมอ และถ้าตั้ง adminUserId ไว้จะ push หาแอดมินด้วย
-   * push กินโควตารายเดือน เลยยิงเฉพาะตอนที่ต้องให้คนมารับช่วงจริง ๆ และปิดไว้เป็นค่าเริ่มต้น
+   * ส่งต่อแอดมิน — ลง log เสมอ แล้วเข้าตัวส่งรายงาน (src/reports.js)
+   *
+   * ตัวส่งรายงานเป็นคนตัดสินว่าจะถึงมือแอดมินเลย หรือเก็บเข้าคิวไว้ก่อน
+   * ตอนที่ยังไม่มีใคร claim สิทธิ์ ระบบไม่รู้ว่าห้องไหนเป็นห้องเจ้าของร้าน
+   * และห้องที่ดูเหมือนห้องเจ้าของอาจเป็นห้องที่เจ้าของทดสอบตัวเองเป็นลูกค้าอยู่
+   * จึงต้องเงียบไว้ก่อน (deliver=local) แล้วค่อยเทคิวให้ตอน claim สำเร็จ
    */
-  async function notifyAdmin(reason, event) {
-    const userId = event.source?.userId ?? "unknown";
+  async function notifyAdmin(reason, event, job = "urgent") {
+    const userId = event?.source?.userId ?? "unknown";
     // log ตัดไอดีเหลือ 8 ตัวพอให้ไล่หาแชทได้ ไม่ต้องเก็บไอดีลูกค้าเต็ม ๆ ไว้ในไฟล์ log
-    console.warn(`🔔 ส่งต่อแอดมิน: ${reason} (user ${userId.slice(0, 8)}…)`);
+    console.warn(`🔔 ส่งต่อแอดมิน: ${reason} (user ${String(userId).slice(0, 8)}…)`);
 
-    if (!adminUserId) return;
+    if (!reports) return;
     try {
-      await client.pushMessage({
-        to: adminUserId,
-        messages: [{ type: "text", text: `🔔 ลูกค้ารอแอดมิน\n${reason}\nuserId: ${userId}` }],
-      });
+      await reports.submit(job, `${reason}\nuserId: ${userId}`);
     } catch (err) {
       // แจ้งแอดมินไม่สำเร็จก็ไม่ควรทำให้ลูกค้าได้ error — ลูกค้าได้ข้อความไปแล้ว
-      console.error("แจ้งแอดมินไม่สำเร็จ:", err instanceof HTTPFetchError ? err.status : err.message);
+      console.error("ส่งรายงานให้แอดมินไม่สำเร็จ:", err instanceof HTTPFetchError ? err.status : err.message);
     }
   }
 

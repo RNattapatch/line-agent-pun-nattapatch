@@ -15,7 +15,9 @@ import { conversations } from "./conversation.js";
 import { TICK_MS, createCardDispatcher } from "./card-dispatcher.js";
 import { verifyImageUrl } from "./image-verify.js";
 import { createPipeline } from "./pipeline.js";
+import { adminClaims } from "./admin-claim.js";
 import { paymentDestinations, qrDestinations } from "./payment.js";
+import { createReports } from "./reports.js";
 import { qrDir } from "./qr-issue.js";
 import { quoteStore } from "./quotes.js";
 
@@ -85,8 +87,28 @@ try {
   console.error(`⚠️  สร้างที่เก็บใบเสนอราคาไม่ได้ (${quoteStore.dir}) — คำขอใบเสนอราคาจะตกไปหาแอดมินทั้งหมด:`, err.message);
 }
 
-if (!ADMIN_USER_ID && !ADMIN_GROUP_ID) {
-  console.warn("⚠️  ไม่ได้ตั้ง ADMIN_USER_ID / ADMIN_GROUP_ID — คำสั่งอนุมัติใบเสนอราคาจะใช้ไม่ได้เลย");
+/*
+ * สิทธิ์ผู้ดูแลมาจากการ claim ด้วยรหัสใช้ครั้งเดียว (ดู src/admin-claim.js)
+ * ยังไม่มีใคร claim = ยังไม่มี Admin lane · รายงานทั้ง 4 งานเก็บเข้าคิวไว้ก่อน (deliver=local)
+ */
+try {
+  adminClaims.ensure();
+} catch (err) {
+  console.error(`⚠️  สร้างที่เก็บสถานะผู้ดูแลไม่ได้ (${adminClaims.dir}):`, err.message);
+}
+
+const reports = createReports({ push: (args) => client.pushMessage(args) });
+const claimStatus = adminClaims.status();
+
+if (claimStatus.hasAdmin) {
+  console.log(`🔐 Admin lane: LINE user ลงท้าย …${claimStatus.adminSuffix} · รายงาน deliver=admin`);
+} else if (ADMIN_USER_ID || ADMIN_GROUP_ID) {
+  console.log("🔐 ใช้ ADMIN_USER_ID / ADMIN_GROUP_ID จาก .env (ยังไม่มีใคร claim สิทธิ์)");
+} else {
+  console.warn(
+    `⚠️  ยังไม่มีแอดมิน — รายงานทั้ง 4 งานเก็บเข้าคิวไว้ก่อน (deliver=local · ค้างอยู่ ${reports.spoolSize()} ชิ้น)\n` +
+      "    ออกรหัสด้วย: node scripts/admin-tool.mjs issue",
+  );
 }
 
 /*
@@ -202,6 +224,8 @@ const pipeline = createPipeline({
   baseUrl: PUBLIC_BASE_URL,
   adminUserId: ADMIN_USER_ID,
   adminGroupId: ADMIN_GROUP_ID,
+  claims: adminClaims,
+  reports,
   askBrain,
   verifyImageUrl,
   logFailure,

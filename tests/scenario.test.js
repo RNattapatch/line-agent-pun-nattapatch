@@ -12,11 +12,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createAdminClaims } from "../src/admin-claim.js";
 import { createCardDispatcher } from "../src/card-dispatcher.js";
 import { createConversations } from "../src/conversation.js";
 import { createInbox } from "../src/inbox.js";
 import { createPipeline } from "../src/pipeline.js";
 import { PRODUCTS } from "../src/products.js";
+import { createReports } from "../src/reports.js";
 import { STATUS, createQuoteStore } from "../src/quotes.js";
 
 const BASE = "https://raw.githubusercontent.com/example/repo/main/public";
@@ -40,7 +42,16 @@ const imageCache = {
   staff: { name: "พนักงาน", path: "/images/staff.jpg" },
 };
 
-function shop({ askBrain = async () => null, verifyImageUrl = async () => true, replyFails = () => false } = {}) {
+/*
+ * withAdmin:true = จำลองว่าเจ้าของร้าน claim สิทธิ์ไปแล้ว (สถานะปกติของร้านที่ใช้งานจริง)
+ * เทสต์เส้นทาง claim เองจะส่ง withAdmin:false เพื่อเริ่มจากสถานะที่ยังไม่มีแอดมิน
+ */
+function shop({
+  askBrain = async () => null,
+  verifyImageUrl = async () => true,
+  replyFails = () => false,
+  withAdmin = true,
+} = {}) {
   const outbox = []; // ทุกข้อความที่ถูกส่งออกไป ไม่ว่าจะ reply หรือ push
 
   /*
@@ -64,10 +75,21 @@ function shop({ askBrain = async () => null, verifyImageUrl = async () => true, 
     },
   };
 
-  const store = createQuoteStore({
-    dir: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "scenario-")), "quotes"),
-  });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "scenario-"));
+  const store = createQuoteStore({ dir: path.join(root, "quotes") });
   const conversations = createConversations();
+
+  /* สถานะสิทธิ์ผู้ดูแลอยู่คนละโฟลเดอร์กับของจริงเสมอ เทสต์ต้องไม่แตะ ~/shop-data */
+  const claims = createAdminClaims({ dir: path.join(root, "admin") });
+  const reports = createReports({
+    dir: path.join(root, "admin"),
+    claims,
+    push: (args) => client.pushMessage(args),
+    log: { log() {}, warn() {}, error() {} },
+  });
+
+  /* claim ด้วยรหัสที่ออกตอนรัน — ไม่มีรหัสตายตัวเขียนไว้ในไฟล์เทสต์ */
+  if (withAdmin) claims.claim(claims.issue().code, ADMIN);
 
   let pipeline;
   const inbox = createInbox({ delayMs: 0, onFlush: (b) => pipeline.handleBatch(b) });
@@ -85,7 +107,8 @@ function shop({ askBrain = async () => null, verifyImageUrl = async () => true, 
     conversations,
     imageCache,
     baseUrl: BASE,
-    adminUserId: ADMIN,
+    claims,
+    reports,
     askBrain,
     verifyImageUrl,
     logFailure: () => {},
@@ -127,7 +150,18 @@ function shop({ askBrain = async () => null, verifyImageUrl = async () => true, 
   const cards = () => toCustomer().filter((m) => m.type === "flex");
   const said = () => toCustomer().filter((m) => m.type === "text").map((m) => m.text).join("\n");
 
-  return { store, dispatcher, conversations, inbox, outbox, say, sendImage, press, buttons, toCustomer, cards, said, pipeline };
+  const toAdmin = () =>
+    outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text ?? "").join("\n");
+
+  /*
+   * รายงานถึงแอดมินเดินทางด้วย push เสมอ (reply ใช้ตอบในแชทที่กำลังคุยอยู่)
+   * แยกออกมาเพื่อให้เทสต์ claim นับได้ตรง ๆ ว่ามีรายงานวิ่งไปหาห้องนั้นกี่ชิ้น
+   * โดยไม่ปนกับคำตอบปกติที่ห้องเดียวกันได้รับ
+   */
+  const reportsTo = (id) =>
+    outbox.filter((o) => o.via === "push" && o.to === id).flatMap((o) => o.messages).map((m) => m.text ?? "");
+
+  return { store, claims, reports, dispatcher, conversations, inbox, outbox, say, sendImage, press, buttons, toCustomer, cards, said, toAdmin, reportsTo, pipeline };
 }
 
 const heroOf = (card) => card.contents?.hero?.url ?? null;
@@ -190,7 +224,7 @@ test("3a) ขอส่วนลดเกินเพดาน → หยุด�
   assert.equal(quote.status, STATUS.DRAFT);
   assert.equal(s.cards().length, 0, "draft ห้ามส่งการ์ดใบเสนอราคา");
 
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, new RegExp(quote.quote_id), "แจ้งแอดมินต้องมี quote_id");
   assert.match(toAdmin, /เกินเพดาน/, "และต้องมีเหตุผล");
 });
@@ -375,7 +409,7 @@ test("ลูกค้าส่งสลิป → แอดมินยืนย
   assert.ok(!/(เงินเข้า|ได้รับเงินแล้ว|ยืนยันการชำระ)/.test(s.said()), "ยังห้ามบอกว่าเงินเข้าแล้ว");
 
   /* แอดมินต้องได้ยินว่าต้องพิมพ์อะไรต่อ */
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, new RegExp(`ยืนยันยอด ${id}`), "ต้องบอก owner action ให้แอดมิน");
 
   /* แอดมินเปิดแอปธนาคารเช็คแล้ว พิมพ์คำสั่งจาก admin lane */
@@ -405,7 +439,7 @@ test("แอดมินยืนยันยอดใบที่ยังไ�
   assert.ok(entry, "ความพยายามยืนยันต้องเหลือร่องรอย");
   assert.equal(entry.actor, ADMIN);
 
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, /ยังไม่ถึงขั้นรับสลิป/);
 });
 
@@ -440,7 +474,7 @@ test("ลูกค้ายิง postback ขอ QR ของใบคนอื
   const toOther = s.outbox.filter((o) => o.to !== CUSTOMER && o.to !== ADMIN).flatMap((o) => o.messages);
   assert.ok(!toOther.some((m) => m.type === "image"), "ห้ามได้ภาพ QR ของใบคนอื่น");
 
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, /ไม่ใช่ของห้องตัวเอง/);
 });
 
@@ -456,7 +490,7 @@ test("LINE ไม่รับการ์ดช่องทางชำระเ
   const id = s.store.list()[0].quote_id;
   await s.say(`ยืนยันสั่งซื้อ ${id}`);
 
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, /ส่งการ์ดช่องทางชำระเงินไม่สำเร็จ/);
   assert.match(toAdmin, new RegExp(id), "ต้องบอกด้วยว่าใบไหน");
 });
@@ -479,7 +513,7 @@ test("รูปโหลดไม่ขึ้นทั้งหมด → ตก
 
   assert.equal(s.cards().length, 0);
   assert.match(s.said(), /บราวนี่/, "ลูกค้ายังต้องเห็นรายการกับราคา");
-  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  const toAdmin = s.toAdmin();
   assert.match(toAdmin, /รูปสินค้าโหลดไม่ขึ้น/);
 });
 
@@ -508,4 +542,157 @@ test("คนล้วงข้อมูลระบบยังโดนปฏ�
 
   assert.match(s.said(), /ไม่เปิดเผยและไม่ให้สิทธิ์/);
   assert.equal(s.cards().length, 0);
+});
+
+/* ═══════════ Claim Admin — Acceptance ทั้ง 4 ข้อ ═══════════ */
+
+/*
+ * เดินเหมือนคนจริงถือมือถือ: คุยเป็นลูกค้า → สั่งเครื่องมือผู้ดูแลออกรหัส →
+ * พิมพ์รหัสในแชท → กลายเป็นแอดมิน → รับรายงาน → revoke → กลับเป็นลูกค้า
+ * ไม่มีรหัสตายตัวในไฟล์นี้ ทุกใบถูกสร้างตอนรัน
+ */
+
+/* ═══ Acceptance 1 ═══ */
+test("Claim 1) customer → ออกรหัส → claim → admin", async () => {
+  const s = shop({ withAdmin: false, askBrain: async () => "บราวนี่กล่อง 6 ชิ้น 189 บาทค่ะ" });
+
+  /* ── ยังเป็นลูกค้า: ได้คำตอบฝั่งขายตามปกติ ── */
+  await s.say("บราวนี่กล่อง 6 ชิ้น ราคาเท่าไหร่คะ");
+  assert.match(s.said(), /189/, "ตอนเป็นลูกค้าต้องได้คำตอบเรื่องราคา");
+  assert.equal(s.claims.currentAdmin(), null);
+
+  /* ── เจ้าของร้านสั่งเครื่องมือผู้ดูแลออกรหัส แล้วพิมพ์ลงแชท ── */
+  const { code } = s.claims.issue();
+  await s.say(code.match(/.{1,4}/g).join(" ")); // พิมพ์ตามที่เห็นบนจอ มีเว้นวรรค
+
+  assert.equal(s.claims.currentAdmin(), CUSTOMER, "ห้องที่พิมพ์รหัสกลายเป็นแอดมิน");
+  assert.match(s.said(), /ยืนยันสิทธิ์ผู้ดูแล/);
+
+  /* ── รหัสต้องไม่ไปโผล่ที่ไหนเลย ── */
+  assert.ok(!JSON.stringify(s.outbox).includes(code), "รหัสห้ามอยู่ในข้อความที่ส่งออก");
+  const remembered = JSON.stringify(s.conversations.recent?.(CUSTOMER) ?? "");
+  assert.ok(!remembered.includes(code), "รหัสห้ามเข้าความจำบทสนทนา");
+});
+
+test("Claim 1b) รหัสผิด/หมดอายุ/ใช้ซ้ำ → relay ตอบเอง ไม่ส่งต่อให้สมองร้าน", async () => {
+  const brainSaw = [];
+  const s = shop({ withAdmin: false, askBrain: async (t) => { brainSaw.push(t); return "ตอบจากสมองร้าน"; } });
+
+  const { code } = s.claims.issue();
+  const nearMiss = code.slice(0, -1) + (code.at(-1) === "A" ? "B" : "A");
+
+  await s.say(nearMiss);                       // ผิด
+  await s.say(code);                           // ถูก
+  await s.say(code);                           // ใช้ซ้ำ
+
+  assert.deepEqual(brainSaw, [], "ไม่มีรหัสใบไหนหลุดไปถึงสมองร้าน (ซึ่งยิงออกนอกเครื่อง)");
+  assert.ok(!JSON.stringify(s.outbox).includes(nearMiss), "รหัสที่พิมพ์ผิดก็ห้ามสะท้อนกลับ");
+  assert.equal(s.claims.currentAdmin(), CUSTOMER, "ใบที่ถูกยัง claim ได้ ส่วนใบซ้ำไม่เปลี่ยนอะไร");
+});
+
+/* ═══ Acceptance 2 ═══ */
+test("Claim 2) งานรายงานทั้ง 4 แบบเข้า Admin ครบ และของที่ค้างก่อน claim ไม่ตกหล่น", async () => {
+  const s = shop({ withAdmin: false });
+
+  /* ── ก่อน claim: มีเรื่องต้องแจ้ง แต่ต้องไม่ยิงเข้าห้องไหน ── */
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง ลด 20%"); // เกินเพดาน → แจ้งด่วน
+  assert.equal(s.reports.deliverMode(), "local");
+  assert.equal(s.reportsTo(CUSTOMER).length, 0, "ก่อน claim ห้ามมีรายงานวิ่งไปหาใคร");
+  assert.equal(s.toAdmin(), "", "และห้ามไปโผล่ห้องอื่นด้วย");
+  assert.ok(s.reports.spoolSize() >= 1, "แต่ต้องเก็บไว้ในคิว");
+
+  const spooled = s.reports.spoolSize();
+
+  /* ── claim แล้วของค้างต้องไหลเข้ามาครบ ── */
+  await s.say(s.claims.issue().code);
+  const flushed = s.reportsTo(CUSTOMER).join("\n");
+  assert.equal(s.reports.spoolSize(), 0, "คิวต้องถูกเทจนหมด");
+  assert.match(flushed, /ค้างคิวไว้ตอนยังไม่มีแอดมิน/);
+  assert.ok(flushed.includes("เกินเพดาน"), `ของที่ค้างไว้ ${spooled} ชิ้นต้องไหลเข้ามา`);
+
+  /* ── ยิงข้อความจำลองของทั้ง 4 งาน (ระบบจริงสร้างใน MP-08) ── */
+  await s.say("ทดสอบรายงาน");
+
+  const got = s.reportsTo(CUSTOMER).join("\n");
+  for (const label of ["รายงานเย็น", "แจ้งด่วน", "แจ้งสลิป", "แจ้งนัดใหม่"]) {
+    assert.ok(got.includes(label), `งาน "${label}" ไม่ถึงแอดมิน`);
+  }
+});
+
+/* ═══ Acceptance 3 ═══ */
+test("Claim 3) Admin ต้องไม่รับ sales reply จากข้อความเดียวกัน", async () => {
+  const asked = "บราวนี่กล่อง 6 ชิ้น ราคาเท่าไหร่คะ";
+
+  /* ถามในฐานะลูกค้า → ได้ราคา */
+  const asCustomer = shop({ withAdmin: false, askBrain: async () => "189 บาทค่ะ" });
+  await asCustomer.say(asked);
+  assert.match(asCustomer.said(), /189/);
+
+  /* ข้อความ "เดียวกัน" แต่ห้องนี้เป็นแอดมินแล้ว → ต้องไม่มีคำตอบขาย */
+  const asAdmin = shop({ withAdmin: false, askBrain: async () => "189 บาทค่ะ" });
+  await asAdmin.say(asAdmin.claims.issue().code);
+  const before = asAdmin.cards().length;
+  await asAdmin.say(asked);
+
+  const said = asAdmin.said();
+  assert.match(said, /ช่องทางผู้ดูแล/, "ต้องบอกว่าห้องนี้ไม่ตอบเรื่องขาย");
+  assert.ok(!/189/.test(said.split("ช่องทางผู้ดูแล").pop()), "ห้ามมีราคาตามมา");
+  assert.equal(asAdmin.cards().length, before, "ห้ามมีการ์ดสินค้า");
+  assert.equal(asAdmin.store.list().length, 0, "ห้ามออกใบเสนอราคาให้แอดมิน");
+});
+
+test("Claim 3b) แอดมินขอใบเสนอราคา → ไม่ออกให้ แต่คำสั่งแอดมินยังใช้ได้", async () => {
+  const s = shop({ withAdmin: false });
+  await s.say(s.claims.issue().code);
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง");
+  assert.equal(s.store.list().length, 0, "แอดมินไม่ใช่ลูกค้า");
+
+  await s.say("ใบเสนอวันนี้");
+  assert.match(s.said(), /ยังไม่มีใบเสนอราคา/, "แต่คำสั่งแอดมินต้องทำงาน");
+});
+
+/* ═══ Acceptance 4 ═══ */
+test("Claim 4) revoke → กลับเป็นลูกค้า · รหัสเดิมใช้ซ้ำไม่ได้ · รายงานกลับเป็น local", async () => {
+  const s = shop({ withAdmin: false, askBrain: async () => "189 บาทค่ะ" });
+
+  const { code } = s.claims.issue();
+  await s.say(code);
+  assert.equal(s.reports.deliverMode(), "admin");
+
+  /* ── เครื่องมือผู้ดูแลสั่ง revoke-admin ── */
+  s.claims.revoke({ actor: "operator" });
+
+  assert.equal(s.claims.currentAdmin(), null);
+  assert.equal(s.reports.deliverMode(), "local", "รายงานกลับเป็น local");
+
+  /* ── กลับเป็นลูกค้าเต็มตัว ── */
+  await s.say("บราวนี่กล่อง 6 ชิ้น ราคาเท่าไหร่คะ");
+  assert.match(s.said(), /189/, "กลับมาได้คำตอบฝั่งขายแล้ว");
+
+  /* ── ใช้รหัสเดิมซ้ำต้องไม่ผ่าน ── */
+  const reportsBefore = s.reportsTo(CUSTOMER).length;
+  await s.say(code);
+  assert.equal(s.claims.currentAdmin(), null, "รหัสเดิมต้อง claim กลับไม่ได้");
+  assert.match(s.said(), /รหัสนี้ใช้ไม่ได้/);
+
+  /* ── และรายงานที่เกิดหลังจากนี้ต้องไม่วิ่งไปหาใคร ── */
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง ลด 20%");
+  assert.equal(s.reportsTo(CUSTOMER).length, reportsBefore, "หลัง revoke ห้ามมีรายงานวิ่งออกไป");
+  assert.ok(s.reports.spoolSize() >= 1, "ต้องเข้าคิวแทน");
+});
+
+test("Claim 4b) claim ใหม่หลัง revoke → ของที่ค้างช่วงไม่มีแอดมินไหลเข้ามาครบ", async () => {
+  const s = shop({ withAdmin: false });
+
+  await s.say(s.claims.issue().code);
+  s.claims.revoke();
+
+  await s.say("ขอใบเสนอราคา บราวนี่กล่อง 2 กล่อง ลด 20%");
+  const queued = s.reports.spoolSize();
+  assert.ok(queued >= 1);
+
+  await s.say(s.claims.issue().code);
+  assert.equal(s.reports.spoolSize(), 0, `ของที่ค้าง ${queued} ชิ้นต้องไหลเข้ามาให้ครบ`);
+  assert.match(s.reportsTo(CUSTOMER).join("\n"), /เกินเพดาน/);
 });

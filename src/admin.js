@@ -14,8 +14,10 @@
  * (ปลอดภัยกว่าเดาว่าใครน่าจะเป็นแอดมิน)
  */
 
+import { adminClaims } from "./admin-claim.js";
 import { confirmPayment } from "./payment-flow.js";
 import { reportLine } from "./quotes.js";
+import { REPORT_JOBS } from "./reports.js";
 
 const QUOTE_ID = "(Q-\\d{8}-\\d{3})";
 
@@ -31,6 +33,11 @@ export const COMMANDS = [
    */
   { name: "confirm", re: new RegExp(`^ยืนยันยอด\\s+${QUOTE_ID}\\s*$`, "i") },
   { name: "today", re: /^ใบเสนอวันนี้\s*$/i },
+  /*
+   * ยิงข้อความจำลองของงานรายงานทั้ง 4 แบบ เพื่อทดสอบ "เส้นทางส่ง" จากมือถือ
+   * ระบบจริงของแต่ละงานสร้างใน MP-08 — อันนี้พิสูจน์แค่ว่าเมื่อของถูกส่ง มันถึงแอดมินจริง
+   */
+  { name: "test-reports", re: /^ทดสอบรายงาน\s*$/i },
 ];
 
 /* ข้อความนี้หน้าตาเหมือนคำสั่งแอดมินไหม (ไม่สนว่าใครพิมพ์) */
@@ -48,19 +55,36 @@ export function parseCommand(input) {
  * source.type ต้องเป็น "user" และ userId ต้องตรงกับ ADMIN_USER_ID เป๊ะ ๆ
  * (หรืออยู่ในกลุ่มแอดมินที่ตั้งไว้เอง)
  */
-export function isAdminLane(event, { adminUserId, adminGroupId } = {}) {
+export function isAdminLane(event, { adminUserId, adminGroupId, claims = adminClaims } = {}) {
   const src = event?.source;
   if (!src) return false;
 
   if (adminGroupId && (src.groupId === adminGroupId || src.roomId === adminGroupId)) return true;
-  if (!adminUserId) return false;
-  return src.type === "user" && src.userId === adminUserId;
+
+  /*
+   * แอดมินที่ claim สิทธิ์มา (src/admin-claim.js) เป็นเส้นทางหลัก
+   * ยังเช็คแบบแชท 1:1 เท่านั้นเหมือนเดิม — แชทกลุ่มที่มีลูกค้าอยู่ด้วยไม่นับ
+   * ต่อให้เจ้าของร้านเป็นคนพิมพ์เอง เพราะ event ในกลุ่มแยกไม่ออกว่าใครพิมพ์
+   * ถ้า LINE ไม่ได้ส่ง userId มาให้ครบ
+   */
+  if (src.type !== "user" || !src.userId) return false;
+  if (claims?.isAdmin(src.userId)) return true;
+
+  /* ADMIN_USER_ID ใน .env ยังใช้ได้ต่อ สำหรับคนที่ตั้งไว้แล้วไม่อยากเปลี่ยนวิธี */
+  return Boolean(adminUserId) && src.userId === adminUserId;
 }
 
 /* ข้อความที่ตอบกลับคนที่พิมพ์คำสั่งแอดมินจากห้องลูกค้า
  * ปฏิเสธตรง ๆ ไม่รับปากว่าเดี๋ยวใครมาจัดการให้ — เหตุผลเดียวกับ src/guard.js */
 export const NOT_ADMIN_REPLY =
   "ขออภัยค่ะ คำสั่งนี้ใช้ได้เฉพาะทีมงานของร้านนะคะ หากมีเรื่องสินค้า ราคา หรือการสั่งซื้อ ยินดีตอบให้เลยค่ะ";
+
+/*
+ * ห้องที่เป็นแอดมินแล้วพิมพ์อะไรที่ไม่ใช่คำสั่ง
+ * ตอบสั้น ๆ ว่าห้องนี้ไม่ตอบเรื่องขาย แทนที่จะเงียบ — เงียบแล้วเจ้าของร้านจะนึกว่าบอทตาย
+ */
+export const ADMIN_ONLY_REPLY =
+  "ห้องนี้เป็นช่องทางผู้ดูแลค่ะ ไม่ตอบคำถามฝั่งขายนะคะ\nคำสั่งที่ใช้ได้: อนุมัติใบเสนอ · ปฏิเสธใบเสนอ · ดูใบเสนอ · ใบเสนอวันนี้ · ยืนยันยอด · ทดสอบรายงาน";
 
 const day = (d = new Date()) =>
   `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
@@ -116,6 +140,14 @@ export function runCommand(command, { store, approver = "admin" } = {}) {
        */
       const res = confirmPayment(command.quoteId, { store, approver });
       return { quote: res.quote, reply: res.reply, customerMessages: res.customerMessages };
+    }
+
+    case "test-reports": {
+      /* ผู้เรียก (pipeline) เป็นคนยิงจริง ที่นี่แค่บอกว่าจะยิงอะไรบ้าง */
+      return {
+        reply: `🧪 ยิงข้อความจำลองของงานรายงานทั้ง ${Object.keys(REPORT_JOBS).length} แบบให้แล้วค่ะ`,
+        testReports: Object.keys(REPORT_JOBS),
+      };
     }
 
     case "today": {
