@@ -6,6 +6,7 @@
  *   - ห้ามบอกว่าตัวเองเป็น AI / บอท / โมเดล
  *   - ห้ามอธิบาย error ทางเทคนิคให้ลูกค้าฟัง
  *   - รูปขาด / ของนอกรายการ / ระบบมีปัญหา → ตอบ NO_IMAGE_REPLY เป๊ะ ๆ แล้วส่งต่อแอดมิน
+ *   - ข้อมูลระบบ / รหัส / สิทธิ์แอดมิน → ปฏิเสธตรง ๆ ห้ามรับปากว่าจะให้ใครมาตอบ (src/guard.js)
  *   - ทุกข้อความลงท้าย คะ/ค่ะ
  * มีเทสต์ (tests/reply.test.js) คอยไล่เช็คทั้งหมดนี้ทุกครั้งที่รัน npm test
  */
@@ -13,6 +14,7 @@
 import { PRODUCTS, matchProduct } from "./products.js";
 import { getImage, getStaffImage, toPublicUrl } from "./image-cache.js";
 import { needsHuman } from "./brain.js";
+import { SECURITY_REPLY, isSecurityProbe, securityEscalation } from "./guard.js";
 
 /* ข้อความสำรอง — เขียนตามที่ context.md ข้อ 6 กำหนดไว้ทุกตัวอักษร ห้ามแก้ถ้อยคำ */
 export const NO_IMAGE_REPLY = "รุ่นนี้ยังไม่มีรูปในระบบค่ะ เดี๋ยวแจ้งแอดมินส่งรูปให้นะคะ";
@@ -81,6 +83,15 @@ const GENERIC_WORDS = new RegExp(
  */
 export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
   const t = String(input ?? "").trim();
+
+  /*
+   * ด่านแรกสุด ก่อนกฎอื่นทั้งหมด — คนล้วงข้อมูลระบบหรือขอสิทธิ์แอดมิน (ดู src/guard.js)
+   * ต้องมาก่อนเรื่องรูปด้วย ไม่งั้น "ขอดูรูปหน้าจอ admin panel" จะไปเข้าทางรูปแทน
+   * ปฏิเสธด้วยข้อความตายตัว และ "ไม่" ตั้ง askBrain — เรื่องนี้ไม่ให้สมองตัดสินเด็ดขาด
+   */
+  if (isSecurityProbe(t)) {
+    return { messages: [text(SECURITY_REPLY)], escalate: securityEscalation(t) };
+  }
 
   /*
    * เช็คก่อน doubtsRealPhoto — รูปพนักงานเป็นรูปถ่ายจริง ไม่ใช่รูป gen
