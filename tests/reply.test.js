@@ -27,15 +27,33 @@ const emptyCache = { products: {} };
 const say = (text, cache = fullCache, baseUrl = BASE) => buildReply(text, { baseUrl, cache });
 const texts = (r) => r.messages.filter((m) => m.type === "text").map((m) => m.text);
 
-test("ขอรูปสินค้าที่มีในระบบ → ส่งรูปจริงพร้อมราคา", () => {
+/*
+ * รูปที่ลูกค้าจะได้เห็นจริง — มาได้ 2 ทาง
+ *   การ์ดสินค้า (Flex)  รูปอยู่ที่ hero.url ของ bubble
+ *   รูปพนักงาน (image) รูปอยู่ที่ originalContentUrl
+ * เทสต์เช็คที่ "ลูกค้าเห็นรูปไหม" ไม่ใช่ชนิดของ message จะได้ไม่ต้องแก้ทุกครั้งที่เปลี่ยนหน้าตาการ์ด
+ */
+const shownImage = (r) => {
+  const flex = r.messages.find((m) => m.type === "flex");
+  if (flex?.contents?.hero?.url) return flex.contents.hero.url;
+  return r.messages.find((m) => m.type === "image")?.originalContentUrl ?? null;
+};
+const hasImage = (r) => shownImage(r) !== null;
+
+test("ขอรูปสินค้าที่มีในระบบ → ได้การ์ดสินค้า 1 ใบ พร้อมรูป ราคา และปุ่ม", () => {
   const r = say("ขอดูรูปชิโอะปังหน่อยค่ะ");
 
-  const image = r.messages.find((m) => m.type === "image");
-  assert.ok(image, "ต้องมี message ชนิด image");
-  assert.equal(image.originalContentUrl, `${BASE}/images/shio-pan.jpg`);
-  assert.equal(image.previewImageUrl, `${BASE}/images/shio-pan.jpg`, "LINE บังคับให้มี previewImageUrl ด้วย");
-  assert.ok(image.originalContentUrl.startsWith("https://"), "LINE รับเฉพาะ HTTPS");
-  assert.match(texts(r).join(" "), /15 บาท/, "ราคาต้องตรงกับ products.md");
+  const card = r.messages.find((m) => m.type === "flex");
+  assert.ok(card, "ต้องมีการ์ด Flex");
+  assert.equal(r.messages.length, 1, "การ์ดใบเดียวจบ ไม่ต้องมีข้อความตามหลัง");
+  assert.equal(card.contents.hero.url, `${BASE}/images/shio-pan.jpg`);
+  assert.ok(card.contents.hero.url.startsWith("https://"), "LINE รับเฉพาะ HTTPS");
+  assert.match(JSON.stringify(card.contents.body), /15 บาท/, "ราคาต้องตรงกับ products.md");
+
+  const labels = card.contents.footer.contents.map((b) => b.action.label);
+  assert.deepEqual(labels, ["สนใจรุ่นนี้", "นัดดูสินค้า"], "ต้องมี CTA ครบทั้งสองปุ่ม");
+
+  assert.equal(r.card.slug, "shio-pan", "server ต้องรู้ว่าส่งการ์ดรุ่นไหนไป เพื่อกันส่งซ้ำ");
   assert.equal(r.escalate, null, "สินค้าที่มีรูปแล้วไม่ต้องรบกวนแอดมิน");
 });
 
@@ -47,9 +65,9 @@ test("แต่ละสินค้าในรายการหยิบร�
   ];
 
   for (const [text, slug] of cases) {
-    const image = say(text).messages.find((m) => m.type === "image");
-    assert.ok(image, `"${text}" ควรได้รูป`);
-    assert.equal(image.originalContentUrl, `${BASE}/images/${slug}.jpg`);
+    const r = say(text);
+    assert.equal(r.card?.slug, slug, `"${text}" ควรได้การ์ดของ ${slug}`);
+    assert.equal(shownImage(r), `${BASE}/images/${slug}.jpg`);
   }
 });
 
@@ -57,7 +75,7 @@ test("ขอรูปของที่ไม่มีในรายการ �
   for (const text of ["ขอดูรูปครัวซองต์หน่อย", "มีรูปเค้กกล้วยหอมไหมคะ", "ขอรูปโดนัทค่ะ"]) {
     const r = say(text);
     assert.deepEqual(texts(r), [NO_IMAGE_REPLY], `"${text}" ต้องตอบข้อความสำรองอย่างเดียว`);
-    assert.ok(!r.messages.some((m) => m.type === "image"), "ห้ามส่งรูปของนอกรายการ");
+    assert.ok(!hasImage(r), "ห้ามส่งรูปของนอกรายการ");
     assert.ok(r.escalate, "ต้องส่งต่อแอดมิน");
   }
 });
@@ -66,7 +84,7 @@ test("kie.ai ล่ม / ยังไม่ได้ gen รูป → ลูก
   const r = say("ขอดูรูปชิโอะปังหน่อย", emptyCache);
 
   assert.deepEqual(texts(r), [NO_IMAGE_REPLY]);
-  assert.ok(!r.messages.some((m) => m.type === "image"), "ไม่มีรูปก็ต้องไม่ส่ง URL ที่โหลดไม่ขึ้น");
+  assert.ok(!hasImage(r), "ไม่มีรูปก็ต้องไม่ส่ง URL ที่โหลดไม่ขึ้น");
   assert.ok(r.escalate, "ต้องส่งต่อแอดมินให้ตามรูปมาส่งลูกค้า");
 });
 
@@ -75,7 +93,7 @@ test("ไฟล์รูปหายจากดิสก์ทั้งที�
   const r = say("ขอรูปชิโอะปัง", brokenCache);
 
   assert.deepEqual(texts(r), [NO_IMAGE_REPLY]);
-  assert.ok(!r.messages.some((m) => m.type === "image"));
+  assert.ok(!hasImage(r));
 });
 
 test("PUBLIC_BASE_URL ไม่ใช่ https → ไม่ส่งรูป (LINE บังคับ TLS)", () => {
@@ -83,14 +101,14 @@ test("PUBLIC_BASE_URL ไม่ใช่ https → ไม่ส่งรูป (
     // เรียก buildReply ตรง ๆ ไม่ผ่าน say() เพราะ helper มีค่า default ที่จะบังค่า undefined ทิ้ง
     const r = buildReply("ขอรูปชิโอะปัง", { baseUrl, cache: fullCache });
     assert.deepEqual(texts(r), [NO_IMAGE_REPLY], `baseUrl "${baseUrl}" ต้องไม่ส่งรูป`);
-    assert.ok(!r.messages.some((m) => m.type === "image"));
+    assert.ok(!hasImage(r));
   }
 });
 
 test('ลูกค้าพูดว่า "บราวนี่" เฉย ๆ → ถามกลับ ไม่เดาให้', () => {
   const r = say("ขอดูรูปบราวนี่หน่อยค่ะ");
 
-  assert.ok(!r.messages.some((m) => m.type === "image"), "กำกวมอยู่ ห้ามเดาส่งรูปไปก่อน");
+  assert.ok(!hasImage(r), "กำกวมอยู่ ห้ามเดาส่งรูปไปก่อน");
   const reply = texts(r).join(" ");
   assert.match(reply, /39/);
   assert.match(reply, /189/);
@@ -122,7 +140,7 @@ test("ขอดูรูปพนักงาน → ส่งรูปน้อ
     const r = say(text);
 
     const image = r.messages.find((m) => m.type === "image");
-    assert.ok(image, `"${text}" ควรได้รูปพนักงาน`);
+    assert.ok(image, `"${text}" ควรได้รูปพนักงาน — รูปพนักงานเป็นรูปถ่ายจริง ส่งเป็น image ไม่ใช่การ์ดสินค้า`);
     assert.equal(image.originalContentUrl, `${BASE}/images/staff.jpg`);
     assert.equal(image.previewImageUrl, `${BASE}/images/staff.jpg`);
     assert.match(texts(r).join(" "), /พนักงาน/);
@@ -133,7 +151,7 @@ test("ขอดูรูปพนักงาน → ส่งรูปน้อ
 test("ขอดูรูปพนักงานแต่รูปไม่อยู่ในแคช → ตอบสุภาพ + ส่งต่อแอดมิน ไม่มีศัพท์เทคนิค", () => {
   const r = say("ขอดูรูปพนักงานหน่อยค่ะ", emptyCache);
 
-  assert.ok(!r.messages.some((m) => m.type === "image"), "ไม่มีรูปก็ต้องไม่ส่ง URL ที่โหลดไม่ขึ้น");
+  assert.ok(!hasImage(r), "ไม่มีรูปก็ต้องไม่ส่ง URL ที่โหลดไม่ขึ้น");
   assert.match(texts(r).join(" "), /แอดมิน/);
   assert.ok(r.escalate, "ต้องส่งต่อแอดมินให้ส่งรูปแทน");
 });
@@ -143,7 +161,7 @@ test('ถามว่า "ของจริงหน้าตาแบบนี
     const r = say(text);
     const reply = texts(r).join(" ");
 
-    assert.ok(!r.messages.some((m) => m.type === "image"), "ห้ามส่งรูปประกอบไปยืนยันแทนของจริง");
+    assert.ok(!hasImage(r), "ห้ามส่งรูปประกอบไปยืนยันแทนของจริง");
     assert.ok(!/ใช่|เหมือนกัน|ตรงปก(ค่ะ|เลย)/.test(reply), `ห้ามยืนยัน: "${reply}"`);
     assert.match(reply, /แอดมิน/);
     assert.ok(r.escalate);

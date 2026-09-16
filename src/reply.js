@@ -9,12 +9,21 @@
  *   - ข้อมูลระบบ / รหัส / สิทธิ์แอดมิน → ปฏิเสธตรง ๆ ห้ามรับปากว่าจะให้ใครมาตอบ (src/guard.js)
  *   - ทุกข้อความลงท้าย คะ/ค่ะ
  * มีเทสต์ (tests/reply.test.js) คอยไล่เช็คทั้งหมดนี้ทุกครั้งที่รัน npm test
+ *
+ * ไฟล์นี้ยัง pure เหมือนเดิม — งานที่ต้องต่อเน็ตถูกส่งกลับไปให้ server.js ทำ ผ่าน 3 ธง:
+ *   askBrain     ให้สมองร้านลองตอบ
+ *   card         การ์ดที่ประกอบไว้แล้ว แต่ยังต้องเอา imageUrl ไปตรวจ 200 ก่อนส่ง
+ *   quoteRequest คำขอใบเสนอราคาที่แกะแล้ว ให้ Quote Engine ไปคิดยอดจาก products.md
+ * ธงพวกนี้ทำให้เทสต์ยังไล่ได้ทุกเส้นทางโดยไม่ต้องต่อเน็ตและไม่ต้องมีไฟล์บน VPS
  */
 
-import { PRODUCTS, matchProduct } from "./products.js";
-import { getImage, getStaffImage, toPublicUrl } from "./image-cache.js";
+import { PRODUCTS, bySlug, matchProduct } from "./products.js";
+import { getStaffImage, toPublicUrl } from "./image-cache.js";
 import { needsHuman } from "./brain.js";
 import { SECURITY_REPLY, isSecurityProbe, securityEscalation } from "./guard.js";
+import { productCard } from "./cards.js";
+import { formatPrice, priceOf } from "./price-source.js";
+import { parseQuoteRequest, wantsQuote } from "./quote-intent.js";
 
 /* ข้อความสำรอง — เขียนตามที่ context.md ข้อ 6 กำหนดไว้ทุกตัวอักษร ห้ามแก้ถ้อยคำ */
 export const NO_IMAGE_REPLY = "รุ่นนี้ยังไม่มีรูปในระบบค่ะ เดี๋ยวแจ้งแอดมินส่งรูปให้นะคะ";
@@ -47,7 +56,8 @@ const asksForStaff = (t) =>
 const doubtsRealPhoto = (t) =>
   /(ของจริง|ตรงปก|รูปจริง|ถ่ายจริง|เหมือนรูป|หน้าตาแบบนี้|แบบในรูป)/.test(t);
 
-const menuLine = (p) => `• ${p.name} ${p.price}`;
+/* ราคาบนเมนูมาจากตารางใน products.md เสมอ ตกลงมาที่ค่าในแคตตาล็อกเฉพาะตอนตารางอ่านไม่ได้ */
+const menuLine = (p) => `• ${p.name} ${formatPrice(priceOf(p.slug)) ?? p.price}`;
 
 /*
  * คำที่ "ไม่ได้ระบุตัวสินค้า" — ใช้ตัดทิ้งเพื่อดูว่าลูกค้าเอ่ยชื่อของอะไรมาจริง ๆ หรือเปล่า
@@ -75,13 +85,19 @@ const GENERIC_WORDS = new RegExp(
 );
 
 /*
- * คืน { messages, escalate }
- *   messages — ข้อความที่จะส่งกลับลูกค้า (ตามรูปแบบ message object ของ LINE)
- *   escalate — เหตุผลที่ต้องส่งต่อแอดมิน หรือ null ถ้าไม่ต้อง
+ * คืน { messages, escalate, askBrain?, card?, quoteRequest? }
+ *   messages     ข้อความที่จะส่งกลับลูกค้า (ตามรูปแบบ message object ของ LINE)
+ *   escalate     เหตุผลที่ต้องส่งต่อแอดมิน หรือ null ถ้าไม่ต้อง
+ *   card         { slug, imageUrl } ของการ์ดที่อยู่ใน messages — server.js ต้องเอา
+ *                imageUrl ไปตรวจ 200 ก่อนส่งจริง และไปปั๊มกันส่งซ้ำที่ตัวส่งการ์ด
+ *   quoteRequest คำขอใบเสนอราคาที่แกะแล้ว ให้ Quote Engine คิดยอดต่อ
+ *
+ * lastSlug คือรุ่นล่าสุดที่มีคนเอ่ยชื่อในห้องนี้ (src/conversation.js)
+ * ใช้ตอบคำขอรูปที่ไม่เอ่ยรุ่น เช่น "มีรูปไหม" — ไม่มีให้ก็ถามกลับเหมือนเดิม ไม่เดา
  *
  * deps รับเข้ามาเพื่อให้เทสต์ยัดแคชปลอมได้ (เช่น จำลองว่ารูปหาย)
  */
-export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
+export function buildReply(input, { baseUrl, cache, imageDir, lastSlug = null } = {}) {
   const t = String(input ?? "").trim();
 
   /*
@@ -103,7 +119,35 @@ export function buildReply(input, { baseUrl, cache, imageDir } = {}) {
     return { messages: [text(REAL_PHOTO_REPLY)], escalate: "ลูกค้าขอรูปถ่ายสินค้าจริง" };
   }
 
-  if (asksForImage(t)) return imageReply(t, { baseUrl, cache, imageDir });
+  if (asksForImage(t)) return imageReply(t, { baseUrl, cache, imageDir, lastSlug });
+
+  /*
+   * ลูกค้าขอใบเสนอราคา — แกะแค่รุ่นกับจำนวน แล้วส่งธงให้ Quote Engine คิดยอดจาก products.md
+   * ข้อความที่คืนตรงนี้เป็น "ทางสำรอง" ถ้า Quote Engine ทำงานไม่ได้เลย (ดิสก์เต็ม / ไฟล์พัง)
+   * server.js จะเขียนทับด้วยการ์ดใบเสนอราคาจริงเมื่อคิดยอดสำเร็จ
+   * เขียนแบบนี้เพราะพลาดฝั่ง "ส่งต่อคน" ยังขายของได้ แต่พลาดฝั่ง "เงียบหาย" ลูกค้าหลุดมือ
+   */
+  if (wantsQuote(t)) {
+    const parsed = parseQuoteRequest(t);
+
+    if (parsed.items.length === 0) {
+      const options = (parsed.ambiguous.length ? parsed.ambiguous : PRODUCTS.map((p) => p.slug))
+        .map((slug) => bySlug(slug))
+        .filter(Boolean);
+      return {
+        messages: [
+          text(`${options.map(menuLine).join("\n")}\nรับเป็นตัวไหน จำนวนเท่าไหร่ดีคะ`),
+        ],
+        escalate: null,
+      };
+    }
+
+    return {
+      messages: [text("ขอส่งให้เจ้าของร้านสรุปยอดให้นะคะ รอสักครู่ค่ะ")],
+      escalate: "ลูกค้าขอใบเสนอราคา",
+      quoteRequest: parsed,
+    };
+  }
 
   if (/^(สวัสดี|หวัดดี|hi|hello)/i.test(t)) {
     return {
@@ -153,12 +197,22 @@ function staffReply({ baseUrl, cache, imageDir }) {
   };
 }
 
-function imageReply(t, { baseUrl, cache, imageDir }) {
+function imageReply(t, { baseUrl, cache, imageDir, lastSlug }) {
   const found = matchProduct(t);
 
   // ลูกค้าพูดถึงบราวนี่เฉย ๆ — ชี้ได้ทั้งแบบชิ้นและแบบกล่อง ถามกลับดีกว่าเดา (context.md ข้อ 2)
   if (found.ambiguous) {
-    const options = found.ambiguous.map((p) => `${p.name} ${p.price}`).join(" กับ ");
+    /*
+     * ยกเว้นกรณีที่เพิ่งคุยรุ่นนั้นกันอยู่ — ลูกค้าถาม "บราวนี่กล่อง 6 ชิ้นเท่าไหร่"
+     * แล้วถามต่อว่า "ขอดูรูปบราวนี่หน่อย" การถามกลับซ้ำอีกรอบทำให้ดูเหมือนร้านไม่ได้ฟัง
+     * ยึดจากรุ่นที่มีคนเอ่ยชื่อจริงเท่านั้น ไม่ได้เดาจากความน่าจะเป็น
+     */
+    const fromContext = found.ambiguous.find((p) => p.slug === lastSlug);
+    if (fromContext) return cardReply(fromContext.slug, { baseUrl, cache, imageDir });
+
+    const options = found.ambiguous
+      .map((p) => `${p.name} ${formatPrice(priceOf(p.slug)) ?? p.price}`)
+      .join(" กับ ");
     return { messages: [text(`มี${options}ค่ะ ดูรูปแบบไหนดีคะ`)], escalate: null };
   }
 
@@ -169,6 +223,13 @@ function imageReply(t, { baseUrl, cache, imageDir }) {
      */
     const leftover = t.replace(GENERIC_WORDS, "");
     if (leftover.length === 0) {
+      /*
+       * ย้อนบริบทก่อน — "มีรูปไหม" ที่ตามหลังการคุยรุ่นใดรุ่นหนึ่ง หมายถึงรุ่นนั้น
+       * ย้อนดูทั้งข้อความลูกค้าและคำตอบของร้าน (ดู src/conversation.js)
+       * ไม่มีบริบทให้ยึด = ยื่นรายการให้เลือกเหมือนเดิม ห้ามเดาไปเองว่าเป็นรุ่นไหน
+       */
+      if (lastSlug) return cardReply(lastSlug, { baseUrl, cache, imageDir });
+
       // รายการขึ้นก่อน แล้วปิดท้ายด้วยคำถาม — ให้ข้อความจบด้วย คะ/ค่ะ ตาม context.md ข้อ 2
       return {
         messages: [text(`${PRODUCTS.map(menuLine).join("\n")}\nดูรูปตัวไหนดีคะ`)],
@@ -182,22 +243,25 @@ function imageReply(t, { baseUrl, cache, imageDir }) {
     return { messages: [text(NO_IMAGE_REPLY)], escalate: `ลูกค้าขอรูปของนอกรายการ: "${t}"` };
   }
 
-  const product = found.match;
-  const entry = getImage(product.slug, dropUndefined({ cache, imageDir }));
-  const url = entry ? toPublicUrl(baseUrl, entry.path) : null;
+  return cardReply(found.match.slug, { baseUrl, cache, imageDir });
+}
 
-  /*
-   * ไม่มีรูปในแคช / ไฟล์หาย / ยังไม่ได้ตั้ง PUBLIC_BASE_URL เป็น https
-   * ทุกกรณีลูกค้าเห็นข้อความเดียวกัน ไม่มีศัพท์เทคนิคหลุดออกไป ส่วนรายละเอียดไปโผล่ที่ log ของแอดมิน
-   */
-  if (!url) {
-    return { messages: [text(NO_IMAGE_REPLY)], escalate: `ยังไม่มีรูปในระบบ: ${product.name}` };
+/*
+ * การ์ดสินค้า 1 ใบ — รูป ชื่อ ราคา และปุ่ม "สนใจรุ่นนี้" / "นัดดูสินค้า"
+ *
+ * ประกอบการ์ดไม่ได้ (ไม่มีรูปในแคช / ไฟล์หาย / ราคาใน products.md ไม่ครบ /
+ * ยังไม่ได้ตั้ง PUBLIC_BASE_URL เป็น https) → ลูกค้าเห็นข้อความเดียวกันหมด
+ * ไม่มีศัพท์เทคนิคหลุดออกไป ส่วนรายละเอียดไปโผล่ที่ log ของแอดมิน
+ */
+function cardReply(slug, { baseUrl, cache, imageDir }) {
+  const card = productCard(slug, dropUndefined({ baseUrl, cache, imageDir }));
+
+  if (!card) {
+    const name = bySlug(slug)?.name ?? slug;
+    return { messages: [text(NO_IMAGE_REPLY)], escalate: `ยังไม่มีรูป/ราคาในระบบ: ${name}` };
   }
 
-  return {
-    messages: [image(url), text(`${product.name} ${product.price}ค่ะ`)],
-    escalate: null,
-  };
+  return { messages: [card.message], escalate: null, card: { slug, imageUrl: card.imageUrl } };
 }
 
 /* ตัด key ที่เป็น undefined ออก เพื่อให้ค่า default ใน getImage ทำงาน */

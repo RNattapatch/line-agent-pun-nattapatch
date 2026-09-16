@@ -8,10 +8,14 @@ import {
 } from "@line/bot-sdk";
 
 import { loadDotEnv } from "./env.js";
-import { buildReply } from "./reply.js";
 import { IMAGE_DIR, readCache } from "./image-cache.js";
 import { askBrain, loadBrain } from "./brain.js";
-import { DEFAULT_DELAY_MS, combine, createInbox } from "./inbox.js";
+import { DEFAULT_DELAY_MS, createInbox } from "./inbox.js";
+import { conversations } from "./conversation.js";
+import { TICK_MS, createCardDispatcher } from "./card-dispatcher.js";
+import { verifyImageUrl } from "./image-verify.js";
+import { createPipeline } from "./pipeline.js";
+import { quoteStore } from "./quotes.js";
 
 loadDotEnv();
 
@@ -20,6 +24,7 @@ const {
   CHANNEL_SECRET,
   PUBLIC_BASE_URL,
   ADMIN_USER_ID,
+  ADMIN_GROUP_ID,
   PORT = 3000,
 } = process.env;
 
@@ -67,6 +72,21 @@ if (!process.env.OPENROUTER_API_KEY) {
 
 console.log(`⏳ รอลูกค้าพิมพ์จบ ${(REPLY_DELAY_MS / 1000).toFixed(0)} วินาที ก่อนตอบ`);
 
+/*
+ * ใบเสนอราคาจริงอยู่นอก repo เสมอ (~/shop-data/quotes โหมด 700 · ไฟล์ 600)
+ * สร้างโฟลเดอร์ตั้งแต่บูต จะได้รู้ตั้งแต่ตอน deploy ว่าเขียนดิสก์ไม่ได้ ไม่ใช่รู้ตอนลูกค้าขอราคา
+ */
+try {
+  quoteStore.ensure();
+  console.log(`🧾 ที่เก็บใบเสนอราคา: ${quoteStore.dir}`);
+} catch (err) {
+  console.error(`⚠️  สร้างที่เก็บใบเสนอราคาไม่ได้ (${quoteStore.dir}) — คำขอใบเสนอราคาจะตกไปหาแอดมินทั้งหมด:`, err.message);
+}
+
+if (!ADMIN_USER_ID && !ADMIN_GROUP_ID) {
+  console.warn("⚠️  ไม่ได้ตั้ง ADMIN_USER_ID / ADMIN_GROUP_ID — คำสั่งอนุมัติใบเสนอราคาจะใช้ไม่ได้เลย");
+}
+
 const app = express();
 
 // เสิร์ฟรูปสินค้าให้ LINE มาโหลด — เป็นไฟล์นิ่ง ไม่มีข้อมูลลูกค้า
@@ -87,7 +107,7 @@ app.post("/webhook", middleware({ channelSecret: CHANNEL_SECRET }), async (req, 
   await Promise.all(
     (req.body.events ?? []).map(async (event) => {
       try {
-        await handleEvent(event);
+        await pipeline.handleEvent(event);
       } catch (err) {
         logFailure("จัดการ event ไม่สำเร็จ", err);
       }
@@ -111,87 +131,40 @@ function logFailure(label, err) {
  * ลูกค้าพิมพ์ทีละบับเบิลสั้น ๆ ต่อกัน ถ้าตอบทันทีที่บับเบิลแรกจะตอบผิดบริบท
  * จึงพักไว้ให้ลูกค้าพิมพ์จบก่อน แล้วรวมทั้งชุดค่อยตอบครั้งเดียว (ดู src/inbox.js)
  */
-const inbox = createInbox({ delayMs: REPLY_DELAY_MS, onFlush: handleBatch });
-
-async function handleEvent(event) {
-  if (event.type !== "message" || event.message.type !== "text") return;
-
-  // กลุ่ม/ห้องใช้ id ของกลุ่ม ไม่งั้นข้อความจากคนละคนในกลุ่มเดียวกันจะแยกชุดกันจนตอบมั่ว
-  const chatId = event.source?.groupId ?? event.source?.roomId ?? event.source?.userId;
-  if (!chatId) return;
-
-  inbox.add(chatId, { text: event.message.text.trim(), replyToken: event.replyToken, event });
-}
-
-async function handleBatch({ texts, replyToken, event, reason }) {
-  const text = combine(texts);
-  if (!text) return;
-
-  if (texts.length > 1) {
-    console.log(`💬 รวม ${texts.length} บับเบิลเป็นข้อความเดียว (${reason})`);
-  }
-
-  /*
-   * รูปทั้งหมดถูกสร้างไว้ล่วงหน้าแล้ว (npm run gen:images) ตรงนี้แค่หยิบจากแคช
-   * เลยตอบได้ในระดับมิลลิวินาที ทันหน้าต่าง 10 วินาทีของ LINE เสมอ
-   */
-  const reply = buildReply(text, { baseUrl: PUBLIC_BASE_URL, cache: imageCache });
-  let { messages, escalate } = reply;
-
-  /*
-   * กฎตายตัวตอบไม่ได้ → ให้สมองร้านลองตอบ (เรื่องรูปไม่มีทางมาถึงตรงนี้)
-   * ตอบได้ = ลูกค้าได้คำตอบจริง ไม่ต้องรอแอดมิน · ตอบไม่ได้ = ใช้ข้อความสำรองเดิม
-   *
-   * ตรงนี้ทำหลังตอบ 200 ให้ LINE ไปแล้ว จึงไม่ชนหน้าต่าง 10 วินาทีของ webhook
-   * ส่วน reply token ที่ใช้เป็นของบับเบิลล่าสุด อายุจึงเหลือเกือบเต็ม (~1 นาที)
-   * พอสำหรับเวลาพัก 7 วิ บวกเพดาน 12 วิของ askBrain
-   */
-  if (reply.askBrain) {
-    const answer = await askBrain(text);
-    if (answer) {
-      messages = [{ type: "text", text: answer }];
-      escalate = null;
-    }
-  }
-
-  /*
-   * ใช้ replyMessage ไม่ใช่ pushMessage:
-   * reply ภายใน 24 ชม.ไม่กินโควตารายเดือน ส่วน push กิน
-   *
-   * แจ้งแอดมินใน finally — ถ้าตอบลูกค้าไม่สำเร็จ (reply token หมดอายุ / LINE ล่ม)
-   * ยิ่งต้องแจ้ง เพราะลูกค้ากำลังรอโดยไม่มีใครรู้ เดิมโค้ดอยู่หลัง replyMessage
-   * พอ throw ขึ้นมา แอดมินเลยไม่เคยได้รับแจ้งในเคสที่ต้องการมากที่สุด
-   */
-  try {
-    await client.replyMessage({ replyToken, messages });
-  } catch (err) {
-    // ดักตรงนี้เอง ไม่ปล่อยขึ้นไปให้ inbox — จะได้ log แบบสั้นเหมือนทางอื่น
-    logFailure("ตอบลูกค้าไม่สำเร็จ", err);
-  } finally {
-    if (escalate) await notifyAdmin(escalate, event);
-  }
-}
+const inbox = createInbox({
+  delayMs: REPLY_DELAY_MS,
+  /* ห่อไว้ในฟังก์ชัน เพราะ pipeline ถูกสร้างทีหลัง (มันต้องรู้จัก inbox ตัวนี้) */
+  onFlush: (batch) => pipeline.handleBatch(batch),
+});
 
 /*
- * ส่งต่อแอดมิน — ลง log เสมอ และถ้าตั้ง ADMIN_USER_ID ไว้จะ push หาแอดมินด้วย
- * push กินโควตารายเดือน เลยยิงเฉพาะตอนที่ต้องให้คนมารับช่วงจริง ๆ และปิดไว้เป็นค่าเริ่มต้น
+ * ตัวส่งการ์ด — ตื่นทุก 1 นาที ส่งการ์ดที่คิวไว้ กันส่งซ้ำรายวัน และเงียบเมื่ออยู่ในบริบทชำระเงิน
+ * ดูเหตุผลของแต่ละกติกาใน src/card-dispatcher.js
  */
-async function notifyAdmin(reason, event) {
-  const userId = event.source?.userId ?? "unknown";
-  // log ตัดไอดีเหลือ 8 ตัวพอให้ไล่หาแชทได้ ไม่ต้องเก็บไอดีลูกค้าเต็ม ๆ ไว้ในไฟล์ log
-  console.warn(`🔔 ส่งต่อแอดมิน: ${reason} (user ${userId.slice(0, 8)}…)`);
+const dispatcher = createCardDispatcher({
+  tickMs: TICK_MS,
+  send: (job) => pipeline.pushProductCard(job),
+  muted: ({ chatId }) => pipeline.inPaymentContext(chatId),
+});
 
-  if (!ADMIN_USER_ID) return;
-  try {
-    await client.pushMessage({
-      to: ADMIN_USER_ID,
-      messages: [{ type: "text", text: `🔔 ลูกค้ารอแอดมิน\n${reason}\nuserId: ${userId}` }],
-    });
-  } catch (err) {
-    // แจ้งแอดมินไม่สำเร็จก็ไม่ควรทำให้ลูกค้าได้ error — ลูกค้าได้ข้อความไปแล้ว
-    console.error("แจ้งแอดมินไม่สำเร็จ:", err instanceof HTTPFetchError ? err.status : err.message);
-  }
-}
+/*
+ * ตรรกะการตัดสินใจทั้งหมดอยู่ใน src/pipeline.js — ที่นี่แค่ต่อสายให้มัน
+ * (แยกไว้เพื่อให้เทสต์เดินสถานการณ์จริงได้โดยไม่ต้องเปิดเซิร์ฟเวอร์ ดู tests/scenario.test.js)
+ */
+const pipeline = createPipeline({
+  client,
+  store: quoteStore,
+  inbox,
+  dispatcher,
+  conversations,
+  imageCache,
+  baseUrl: PUBLIC_BASE_URL,
+  adminUserId: ADMIN_USER_ID,
+  adminGroupId: ADMIN_GROUP_ID,
+  askBrain,
+  verifyImageUrl,
+  logFailure,
+});
 
 /*
  * ถ้าไม่ดักตรงนี้ Express จะเหมา error จาก middleware เป็น 500 + พ่น stack trace ออกไป
@@ -214,6 +187,9 @@ const server = app.listen(PORT, () =>
   console.log(`Worker ทำงานที่ port ${PORT} — webhook: POST /webhook`),
 );
 
+dispatcher.start();
+console.log(`🗂  ตัวส่งการ์ดตื่นทุก ${(TICK_MS / 1000).toFixed(0)} วินาที`);
+
 /*
  * ตอนรีสตาร์ต (deploy ใหม่) จะมีลูกค้าที่ข้อความยังพักอยู่ในคิว
  * ถ้าดับเลยลูกค้ากลุ่มนั้นจะไม่ได้รับคำตอบและไม่มีใครรู้ — ตอบให้จบก่อนค่อยดับ
@@ -221,6 +197,7 @@ const server = app.listen(PORT, () =>
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, async () => {
     console.log(`ได้รับ ${signal} — ตอบข้อความที่ค้างอยู่ ${inbox.size} ชุดก่อนปิด`);
+    dispatcher.stop();
     server.close();
     try {
       await inbox.flushAll();

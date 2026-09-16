@@ -11,7 +11,8 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "gen:images": "node scripts/gen-images.mjs",
-    "test": "node --test \"tests/*.test.js\""
+    "test": "node --test \"tests/*.test.js\"",
+    "check:cards": "node scripts/check-card-images.mjs"
   },
   "dependencies": {
     "@line/bot-sdk": "^11.2.0",

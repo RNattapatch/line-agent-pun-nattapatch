@@ -30,3 +30,6 @@ build/
 
 # macOS
 .DS_Store
+
+# ธุรกรรมจริง — อยู่บน VPS ที่ ~/shop-data เท่านั้น ห้ามขึ้น repo เด็ดขาด
+shop-data/

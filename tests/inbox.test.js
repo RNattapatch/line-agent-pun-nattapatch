@@ -201,7 +201,7 @@ test("ข้อความที่รวมแล้วยังเข้า�
     cache,
   });
 
-  const image = r.messages.find((m) => m.type === "image");
-  assert.ok(image, "รวมบับเบิลแล้วต้องรู้ว่าลูกค้าขอรูปบราวนี่กล่อง");
-  assert.match(image.originalContentUrl, /brownie-box\.jpg$/);
+  // ตอนนี้ตอบเป็นการ์ดสินค้า (Flex) รูปจึงอยู่ในช่อง hero ของ bubble
+  assert.equal(r.card?.slug, "brownie-box", "รวมบับเบิลแล้วต้องรู้ว่าลูกค้าขอรูปบราวนี่กล่อง");
+  assert.match(r.card.imageUrl, /brownie-box\.jpg$/);
 });

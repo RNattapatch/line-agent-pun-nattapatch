@@ -1,0 +1,45 @@
+{
+  "type": "bubble",
+  "size": "mega",
+  "header": {
+    "type": "box",
+    "layout": "vertical",
+    "backgroundColor": "#8C6A3F",
+    "paddingAll": "12px",
+    "contents": [
+      { "type": "text", "text": "ใบเสนอราคา", "color": "#FFFFFF", "weight": "bold", "size": "sm" },
+      { "type": "text", "text": "{{quote_id}}", "color": "#FFFFFF", "size": "xs" }
+    ]
+  },
+  "body": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": [
+      { "type": "box", "layout": "vertical", "spacing": "xs", "contents": "{{items}}" },
+      { "type": "separator", "margin": "md" },
+      { "type": "box", "layout": "vertical", "spacing": "xs", "margin": "md", "contents": "{{totals}}" },
+      { "type": "text", "text": "ยืนราคาถึง {{expires_at}}", "size": "xxs", "color": "#999999", "margin": "md", "wrap": true }
+    ]
+  },
+  "footer": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": [
+      {
+        "type": "button",
+        "style": "primary",
+        "height": "sm",
+        "color": "#8C6A3F",
+        "action": { "type": "message", "label": "ยืนยันสั่งซื้อ", "text": "ยืนยันสั่งซื้อ {{quote_id}}" }
+      },
+      {
+        "type": "button",
+        "style": "secondary",
+        "height": "sm",
+        "action": { "type": "message", "label": "ขอคุยกับแอดมิน", "text": "ขอคุยกับแอดมินเรื่อง {{quote_id}}" }
+      }
+    ]
+  }
+}

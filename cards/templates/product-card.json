@@ -1,0 +1,40 @@
+{
+  "type": "bubble",
+  "size": "kilo",
+  "hero": {
+    "type": "image",
+    "url": "{{image_url}}",
+    "size": "full",
+    "aspectRatio": "1:1",
+    "aspectMode": "cover"
+  },
+  "body": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": [
+      { "type": "text", "text": "{{name}}", "weight": "bold", "size": "md", "wrap": true },
+      { "type": "text", "text": "{{price}}", "size": "sm", "color": "#8C6A3F", "wrap": true }
+    ]
+  },
+  "footer": {
+    "type": "box",
+    "layout": "vertical",
+    "spacing": "sm",
+    "contents": [
+      {
+        "type": "button",
+        "style": "primary",
+        "height": "sm",
+        "color": "#8C6A3F",
+        "action": { "type": "message", "label": "สนใจรุ่นนี้", "text": "สนใจ {{name}}" }
+      },
+      {
+        "type": "button",
+        "style": "secondary",
+        "height": "sm",
+        "action": { "type": "message", "label": "นัดดูสินค้า", "text": "ขอนัดดูสินค้า {{name}}" }
+      }
+    ]
+  }
+}
