@@ -13,7 +13,7 @@
 import { HTTPFetchError } from "@line/bot-sdk";
 
 import { NOT_ADMIN_REPLY, isAdminLane, parseCommand, runCommand } from "./admin.js";
-import { NO_IMAGE_REPLY, buildReply } from "./reply.js";
+import { NO_IMAGE_REPLY, browseReply, buildReply } from "./reply.js";
 import { productCard } from "./cards.js";
 import { bySlug, matchProduct } from "./products.js";
 import { wantsCard } from "./quote-intent.js";
@@ -190,6 +190,25 @@ export function createPipeline({
         console.warn(`🖼  รูปของ ${reply.card.slug} ตรวจไม่ผ่าน — ใช้ข้อความสำรองแทน`);
         messages = [{ type: "text", text: NO_IMAGE_REPLY }];
         escalate = `รูปโหลดไม่ขึ้น ส่งการ์ดไม่ได้: ${reply.card.slug}`;
+      }
+    }
+
+    /*
+     * carousel ของทั้งร้าน — ตรวจรูปทุกใบพร้อมกัน ใบไหนไม่ผ่าน 200 ตัดทิ้งแล้วประกอบใหม่
+     * ยิงขนานเพราะต้องทันหน้าต่างตอบของ LINE (ผลตรวจถูกแคช 6 ชม. รอบถัดไปจึงไม่เสียเวลาอีก)
+     * ตัดทิ้งทีละใบดีกว่ายกเลิกทั้งก้อน — สินค้าตัวเดียวรูปพังไม่ควรทำให้ลูกค้าไม่เห็นอะไรเลย
+     */
+    if (reply.cards) {
+      const checked = await Promise.all(
+        reply.cards.map(async (c) => ((await verifyImageUrl(c.imageUrl)) ? c.slug : null)),
+      );
+      const ok = checked.filter(Boolean);
+
+      if (ok.length < reply.cards.length) {
+        console.warn(`🖼  รูปตรวจไม่ผ่าน ${reply.cards.length - ok.length} ใบ — ส่งเท่าที่ส่งได้`);
+        const rebuilt = browseReply({ baseUrl, cache: imageCache }, ok);
+        messages = rebuilt.messages;
+        if (ok.length === 0) escalate = "รูปสินค้าโหลดไม่ขึ้นทั้งหมด ส่งการ์ดรวมไม่ได้";
       }
     }
 

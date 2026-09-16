@@ -28,7 +28,7 @@ const imageCache = {
   staff: { name: "พนักงาน", path: "/images/staff.jpg" },
 };
 
-function shop({ askBrain = async () => null } = {}) {
+function shop({ askBrain = async () => null, verifyImageUrl = async () => true } = {}) {
   const outbox = []; // ทุกข้อความที่ถูกส่งออกไป ไม่ว่าจะ reply หรือ push
   const client = {
     async replyMessage({ messages }) {
@@ -62,7 +62,7 @@ function shop({ askBrain = async () => null } = {}) {
     baseUrl: BASE,
     adminUserId: ADMIN,
     askBrain,
-    verifyImageUrl: async () => true,
+    verifyImageUrl,
     logFailure: () => {},
   });
 
@@ -112,13 +112,15 @@ test("1) ถามสินค้าระบุรุ่น แล้วถา�
   assert.equal(heroOf(cards[0]), `${BASE}/images/brownie-box.jpg`, "ต้องเป็นรุ่นเดียวกับที่ถามไว้");
 });
 
-test("1b) ไม่เคยเอ่ยรุ่นเลยแล้วถาม 'มีรูปไหม' → ถามกลับ ไม่เดา", async () => {
+test("1b) ไม่เคยเอ่ยรุ่นเลยแล้วถาม 'มีรูปไหม' → ยื่นการ์ดทั้งร้านให้เลือก ไม่เดารุ่น", async () => {
   const s = shop();
 
   await s.say("มีรูปไหม");
 
-  assert.equal(s.cards().length, 0, "ไม่มีบริบทให้ยึด ห้ามเดาส่งการ์ด");
-  assert.match(s.said(), /ดูรูปตัวไหนดีคะ/);
+  const cards = s.cards();
+  assert.equal(cards.length, 1, "ได้การ์ดก้อนเดียว (carousel)");
+  assert.equal(cards[0].contents.type, "carousel", "ไม่มีบริบทให้ยึด ห้ามเดาส่งรุ่นเดียว");
+  assert.equal(cards[0].contents.contents.length, PRODUCTS.length, "ต้องยื่นให้ครบทุกตัว");
 });
 
 /* ═══ Acceptance 2 ═══ */
@@ -278,6 +280,28 @@ test("ยืนยันสั่งซื้อ → ได้เลขพร้
   assert.equal(s.store.get(id).status, STATUS.SLIP);
 });
 
+test("รูปบางใบโหลดไม่ขึ้น → ส่งเท่าที่ส่งได้ ไม่ล้มทั้งก้อน", async () => {
+  /* จำลองว่ารูปบราวนี่ทั้งสองแบบหายไปจาก CDN */
+  const s = shop({ verifyImageUrl: async (url) => !url.includes("brownie") });
+
+  await s.say("ขอดูสินค้าหน่อย");
+
+  const carousel = s.cards()[0];
+  assert.equal(carousel.contents.contents.length, 2, "เหลือ 2 ใบที่รูปยังโหลดขึ้น");
+  assert.ok(!JSON.stringify(carousel).includes("brownie"), "ใบที่รูปพังต้องไม่หลุดไปขึ้นกรอบเทา");
+});
+
+test("รูปโหลดไม่ขึ้นทั้งหมด → ตกไปใช้ลิสต์ข้อความ + เรียกแอดมิน", async () => {
+  const s = shop({ verifyImageUrl: async () => false });
+
+  await s.say("ขอดูสินค้าหน่อย");
+
+  assert.equal(s.cards().length, 0);
+  assert.match(s.said(), /บราวนี่/, "ลูกค้ายังต้องเห็นรายการกับราคา");
+  const toAdmin = s.outbox.filter((o) => o.to === ADMIN).flatMap((o) => o.messages).map((m) => m.text).join("\n");
+  assert.match(toAdmin, /รูปสินค้าโหลดไม่ขึ้น/);
+});
+
 test("ข้อความปกติยังทำงานเหมือนเดิม — เมนู ทักทาย รูปพนักงาน", async () => {
   const s = shop();
 
@@ -286,7 +310,12 @@ test("ข้อความปกติยังทำงานเหมือ�
   await s.say("ขอดูรูปพนักงานหน่อย");
 
   assert.match(s.said(), /ยินดีให้บริการค่ะ/);
-  assert.match(s.said(), /189 บาท \/ กล่อง/);
+
+  /* "เมนู" ตอบด้วยการ์ดทั้งร้านแล้ว ราคาจึงอยู่บนการ์ด ไม่ใช่ในข้อความ */
+  const menu = s.cards().find((c) => c.contents.type === "carousel");
+  assert.ok(menu, "เมนูต้องเป็นการ์ดทั้งร้าน");
+  assert.match(JSON.stringify(menu), /189 บาท \/ กล่อง/, "ราคาต้องมาจาก products.md");
+
   assert.ok(s.toCustomer().some((m) => m.type === "image"), "รูปพนักงานยังเป็นรูปถ่ายจริง ไม่ใช่การ์ดสินค้า");
 });
 

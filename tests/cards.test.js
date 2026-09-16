@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { loadKeywords, loadTemplate, productCard, quoteCard, render } from "../src/cards.js";
+import { loadKeywords, loadTemplate, productCarousel, productCard, quoteCard, render } from "../src/cards.js";
 import { isPermanentUrl, clearVerifyCache, verifyImageUrl } from "../src/image-verify.js";
 import { PRODUCTS } from "../src/products.js";
 import { loadPriceList } from "../src/price-source.js";
@@ -147,6 +147,40 @@ test("การ์ดใบเสนอราคาโชว์ครบทุ�
 test("render() ปฏิเสธการเอาอาร์เรย์ไปต่อกับข้อความ", () => {
   assert.throws(() => render({ t: "ก่อน {{items}} หลัง" }, { items: [1, 2] }), TypeError);
   assert.deepEqual(render({ t: "{{items}}" }, { items: [1, 2] }), { t: [1, 2] });
+});
+
+test("productCarousel รวมการ์ดทั้งร้านเป็นก้อนเดียว", () => {
+  const all = PRODUCTS.map((p) => p.slug);
+  const built = productCarousel(all, { baseUrl: BASE, cache: fullCache });
+
+  assert.equal(built.message.contents.type, "carousel");
+  assert.equal(built.message.contents.contents.length, PRODUCTS.length);
+  assert.deepEqual(built.cards.map((c) => c.slug), all, "ต้องบอกได้ว่ามีใบไหนบ้าง เพื่อเอาไปตรวจรูป");
+  assert.ok(!/\/images\/|https?:|\.jpe?g/i.test(built.message.altText), `altText หลุด: ${built.message.altText}`);
+});
+
+test("เหลือใบเดียวไม่ต้องห่อเป็น carousel — bubble เดี่ยวแสดงเต็มจอกว่า", () => {
+  const built = productCarousel(["shio-pan"], { baseUrl: BASE, cache: fullCache });
+  assert.equal(built.message.contents.type, "bubble");
+  assert.equal(built.cards.length, 1);
+});
+
+test("ใบที่ประกอบไม่ได้ถูกข้ามไป ไม่ล้มทั้งก้อน", () => {
+  /* มีรูปแค่ 2 ตัว — ที่เหลือต้องหายไปเงียบ ๆ ไม่ใช่ทำให้ลูกค้าไม่เห็นอะไรเลย */
+  const partial = {
+    products: {
+      "shio-pan": { name: "ขนมปังชิโอะปัง", path: "/images/shio-pan.jpg" },
+      "brownie-box": { name: "บราวนี่ (กล่อง 6 ชิ้น)", path: "/images/brownie-box.jpg" },
+    },
+  };
+  const built = productCarousel(PRODUCTS.map((p) => p.slug), { baseUrl: BASE, cache: partial });
+
+  assert.deepEqual(built.cards.map((c) => c.slug), ["shio-pan", "brownie-box"]);
+});
+
+test("ประกอบไม่ได้สักใบ → null ให้ผู้เรียกไปใช้ลิสต์ข้อความ", () => {
+  assert.equal(productCarousel(PRODUCTS.map((p) => p.slug), { baseUrl: BASE, cache: { products: {} } }), null);
+  assert.equal(productCarousel([], { baseUrl: BASE, cache: fullCache }), null);
 });
 
 test("cards/ เก็บได้เฉพาะ template กับคีย์เวิร์ด — ห้ามมีข้อมูลลูกค้า", () => {

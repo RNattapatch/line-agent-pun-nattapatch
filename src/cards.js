@@ -167,4 +167,32 @@ export function quoteCard(quote) {
   return flex(`ใบเสนอราคา ${quote.quote_id} ยอดสุทธิ ${formatBaht(quote.net)} บาท`, bubble);
 }
 
+/*
+ * การ์ดหลายใบเรียงให้ปัดดู — ใช้ตอบคำขอแบบกว้าง ("ขอดูสินค้า" / "เมนู" / "มีอะไรบ้าง")
+ *
+ * คืน null ถ้าประกอบไม่ได้สักใบ ผู้เรียกต้องตกไปใช้ลิสต์ข้อความแทน
+ * ใบไหนประกอบไม่ได้ (ไม่มีรูปในแคช / ราคาใน products.md ไม่ครบ) ก็ข้ามไปเงียบ ๆ
+ * ดีกว่าไม่โชว์อะไรเลยเพราะสินค้าตัวเดียวมีปัญหา
+ *
+ * LINE รับ bubble ได้สูงสุด 12 ใบต่อ 1 ข้อความ — ร้านมี 4 ตัว ยังอีกไกล
+ * แต่ตัดไว้กันวันที่เจ้าของร้านเพิ่มสินค้าจนเกิน แล้วการ์ดทั้งก้อนส่งไม่ออกโดยไม่รู้ตัว
+ */
+export function productCarousel(slugs, options = {}) {
+  const built = slugs.map((slug) => productCard(slug, options)).filter(Boolean).slice(0, 12);
+  if (built.length === 0) return null;
+
+  const cards = built.map((b) => ({ slug: b.slug, imageUrl: b.imageUrl }));
+
+  /* ใบเดียวไม่ต้องห่อเป็น carousel — bubble เดี่ยวแสดงเต็มจอกว่า อ่านง่ายกว่า */
+  if (built.length === 1) return { message: built[0].message, cards };
+
+  return {
+    message: flex(`รายการสินค้าของร้าน ${built.length} รายการค่ะ`, {
+      type: "carousel",
+      contents: built.map((b) => b.message.contents),
+    }),
+    cards,
+  };
+}
+
 const dropUndefined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));

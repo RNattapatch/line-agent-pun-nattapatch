@@ -21,7 +21,7 @@ import { PRODUCTS, bySlug, matchProduct } from "./products.js";
 import { getStaffImage, toPublicUrl } from "./image-cache.js";
 import { needsHuman } from "./brain.js";
 import { SECURITY_REPLY, isSecurityProbe, securityEscalation } from "./guard.js";
-import { productCard } from "./cards.js";
+import { productCard, productCarousel } from "./cards.js";
 import { formatPrice, priceOf } from "./price-source.js";
 import { parseQuoteRequest, wantsQuote } from "./quote-intent.js";
 
@@ -55,6 +55,30 @@ const asksForStaff = (t) =>
  */
 const doubtsRealPhoto = (t) =>
   /(ของจริง|ตรงปก|รูปจริง|ถ่ายจริง|เหมือนรูป|หน้าตาแบบนี้|แบบในรูป)/.test(t);
+
+/*
+ * ลูกค้าขอดู "ของทั้งร้าน" แบบไม่เจาะจงรุ่นหรือเปล่า
+ *
+ * เดิมกฎเมนูบังคับให้พิมพ์ว่า "เมนู" เป๊ะ ๆ คำเดียว คำที่มีหางอย่าง
+ * "ขอดูเมนูทั้งหมดครับ" จึงหลุดไปให้สมองร้านแต่งเมนูเอง แล้วสมองเขียน
+ * "บราวนี่ 39 บาท/ชิ้น" ทิ้งวงเล็บ (ชิ้น)/(กล่อง) ไป ซึ่งไม่ตรงกับ products.md
+ * (เจอจริงในแชทลูกค้า 16 ก.ย. 2026) — ตรงนี้จึงจับให้กว้างขึ้นและตอบด้วยกฎตายตัวแทน
+ *
+ * ผู้เรียกต้องเช็คก่อนว่าลูกค้า "ไม่ได้" เอ่ยชื่อรุ่นไหนมา ถึงจะใช้ตัวนี้ได้
+ * ไม่งั้น "ขอดูรายการบราวนี่" จะกลายเป็นโชว์ทั้งร้านแทนที่จะตอบเรื่องบราวนี่
+ */
+const BROWSE_NOUN = /(สินค้า|เมนู|รายการ|แคตตาล็อก|แคตาล็อก|catalog|menu|ขนม|เบเกอรี่)/i;
+const BROWSE_INTENT = /(ดู|ขอ|มี|ขาย|อะไร|บ้าง|ทั้งหมด|แนะนำ|สนใจ|เอา)/;
+
+/*
+ * ต้องมี "คำที่ชี้ถึงของทั้งร้าน" คู่กับ "ท่าทีอยากเห็น" ถึงจะนับ
+ * จะจับแค่คำว่า "อะไรบ้าง" เฉย ๆ ไม่ได้ เพราะ "มีโปรอะไรบ้าง" / "ส่งวันไหนได้บ้าง"
+ * เป็นคำถามคนละเรื่อง ที่สมองร้านตอบได้ดีกว่าการโยนการ์ดสินค้าใส่
+ */
+/* พิมพ์คำเดียวโดด ๆ ("เมนู") ก็คือขอดูของทั้งร้าน ไม่ต้องมีคำขออะไรเพิ่ม */
+const BARE_BROWSE = /^\s*(เมนู|สินค้า|รายการ(สินค้า)?|แคตตาล็อก|แคตาล็อก|catalog|menu)\s*$/i;
+
+const asksToBrowse = (t) => BARE_BROWSE.test(t) || (BROWSE_NOUN.test(t) && BROWSE_INTENT.test(t));
 
 /* ราคาบนเมนูมาจากตารางใน products.md เสมอ ตกลงมาที่ค่าในแคตตาล็อกเฉพาะตอนตารางอ่านไม่ได้ */
 const menuLine = (p) => `• ${p.name} ${formatPrice(priceOf(p.slug)) ?? p.price}`;
@@ -156,11 +180,17 @@ export function buildReply(input, { baseUrl, cache, imageDir, lastSlug = null } 
     };
   }
 
-  if (t === "เมนู") {
-    return {
-      messages: [text(`เมนูของร้านค่ะ\n${PRODUCTS.map(menuLine).join("\n")}\nอยากดูรูปตัวไหนบอกได้เลยค่ะ`)],
-      escalate: null,
-    };
+  /*
+   * ขอดูของทั้งร้านแบบไม่เจาะจงรุ่น → ส่งการ์ดทั้งหมดให้ปัดดู
+   * เช็คว่าไม่มีชื่อรุ่นในประโยคก่อน — เอ่ยรุ่นมาแล้วต้องตอบเรื่องรุ่นนั้น ไม่ใช่เหมาโชว์ทั้งร้าน
+   */
+  /*
+   * needsHuman() ต้องชนะเสมอ — "ขนมบูดขอคืนเงินหน่อย" มีทั้งคำว่า "ขนม" และ "ขอ"
+   * จึงเข้าเงื่อนไขขอดูของทั้งร้านได้เต็ม ๆ ทั้งที่เป็นเรื่องร้องเรียน
+   * ยิงการ์ดขายของใส่คนที่กำลังโกรธคือทางที่แย่ที่สุดที่จะตอบ (context.md ข้อ 5)
+   */
+  if (!needsHuman(t) && asksToBrowse(t) && matchProduct(t).none) {
+    return browseReply({ baseUrl, cache, imageDir });
   }
 
   /*
@@ -173,6 +203,31 @@ export function buildReply(input, { baseUrl, cache, imageDir, lastSlug = null } 
     messages: [text("รับทราบค่ะ เดี๋ยวแอดมินมาตอบให้นะคะ")],
     escalate: "ข้อความที่บอทยังตอบเองไม่ได้",
     askBrain: !needsHuman(t),
+  };
+}
+
+/*
+ * การ์ดสินค้าทั้งร้านเรียงให้ปัดดู — ใช้ตอบคำขอแบบกว้างทุกทาง
+ * ("ขอดูสินค้า" · "เมนู" · "มีอะไรบ้าง" · "ขอดูรูปหน่อย" ที่ไม่บอกรุ่น)
+ *
+ * slugs รับเข้ามาได้เพื่อให้ server.js ประกอบใหม่จากเฉพาะใบที่รูปตรวจผ่าน 200
+ * ประกอบไม่ได้สักใบ → ตกไปใช้ลิสต์ข้อความเหมือนเดิม ลูกค้ายังได้เห็นรายการกับราคา
+ * ดีกว่าเงียบ และยังไม่มีศัพท์เทคนิคหลุดออกไป (context.md ข้อ 6)
+ */
+export function browseReply({ baseUrl, cache, imageDir } = {}, slugs = PRODUCTS.map((p) => p.slug)) {
+  const built = productCarousel(slugs, dropUndefined({ baseUrl, cache, imageDir }));
+
+  if (!built) {
+    return {
+      messages: [text(`${PRODUCTS.map(menuLine).join("\n")}\nสนใจตัวไหนบอกได้เลยค่ะ`)],
+      escalate: null,
+    };
+  }
+
+  return {
+    messages: [built.message, text("ปัดดูได้เลยค่ะ สนใจตัวไหนกดปุ่มบนการ์ดได้เลยนะคะ")],
+    escalate: null,
+    cards: built.cards,
   };
 }
 
@@ -230,11 +285,8 @@ function imageReply(t, { baseUrl, cache, imageDir, lastSlug }) {
        */
       if (lastSlug) return cardReply(lastSlug, { baseUrl, cache, imageDir });
 
-      // รายการขึ้นก่อน แล้วปิดท้ายด้วยคำถาม — ให้ข้อความจบด้วย คะ/ค่ะ ตาม context.md ข้อ 2
-      return {
-        messages: [text(`${PRODUCTS.map(menuLine).join("\n")}\nดูรูปตัวไหนดีคะ`)],
-        escalate: null,
-      };
+      /* ไม่มีบริบทให้ยึด → โชว์การ์ดทั้งร้านให้เลือกเอง ดีกว่ายื่นลิสต์ตัวหนังสือแล้วให้พิมพ์ตอบ */
+      return browseReply({ baseUrl, cache, imageDir });
     }
     /*
      * ลูกค้าเอ่ยชื่อของที่ไม่มีในรายการ (เช่น เค้กกล้วยหอมแยกชิ้น ครัวซองต์)
